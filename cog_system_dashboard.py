@@ -202,171 +202,6 @@ print(f"Total distinct users: {total_users}")
 
 # COMMAND ----------
 
-# Asset Name, Owner, Description, comments and tags
-from pyspark.sql.utils import AnalysisException
-
-# SQL Query for Efficient Metadata Extraction
-metadata_query = """
-WITH CatalogMetadata AS (
-    SELECT 
-        c.catalog_name, 
-        c.owner AS catalog_owner, 
-        ct.tag_value AS catalog_tags
-    FROM system.information_schema.catalogs c
-    LEFT JOIN system.information_schema.catalog_tags ct 
-        ON c.catalog_name = ct.catalog_name
-),
-
-SchemaMetadata AS (
-    SELECT 
-        s.schema_name, 
-        s.catalog_name, 
-        s.owner AS schema_owner, 
-        st.tag_value AS schema_tags
-    FROM system.information_schema.schemata s
-    LEFT JOIN system.information_schema.schema_tags st 
-        ON s.schema_name = st.schema_name
-),
-
-TableMetadata AS (
-    SELECT 
-        t.table_name, 
-        t.schema_name, 
-        t.catalog_name, 
-        t.owner AS table_owner, 
-        t.comment AS table_comment, 
-        tt.tag_value AS table_tags
-    FROM system.information_schema.tables t
-    LEFT JOIN system.information_schema.table_tags tt 
-        ON t.table_name = tt.table_name
-),
-
-ColumnMetadata AS (
-    SELECT 
-        col.column_name, 
-        col.table_name, 
-        col.schema_name, 
-        col.catalog_name, 
-        col.comment AS column_comment, 
-        ctt.tag_value AS column_tags
-    FROM system.information_schema.columns col
-    LEFT JOIN system.information_schema.catalog_tags ctt 
-        ON col.column_name = ctt.column_name
-)
-
-SELECT 
-    cm.catalog_name,
-    cm.catalog_owner,
-    cm.catalog_tags,
-    sm.schema_name,
-    sm.schema_owner,
-    sm.schema_tags,
-    tm.table_name,
-    tm.table_owner,
-    tm.table_comment,
-    tm.table_tags,
-    colm.column_name,
-    colm.column_comment,
-    colm.column_tags
-FROM ColumnMetadata colm
-LEFT JOIN TableMetadata tm ON colm.table_name = tm.table_name
-LEFT JOIN SchemaMetadata sm ON tm.schema_name = sm.schema_name
-LEFT JOIN CatalogMetadata cm ON sm.catalog_name = cm.catalog_name
-"""
-
-# Execute Query & Convert to DataFrame
-try:
-    metadata_df = spark.sql(metadata_query)
-    print("✅ Successfully retrieved metadata!")
-except AnalysisException as e:
-    print(f"❌ Error retrieving metadata: {str(e)}")
-    exit()
-
-# Display Results
-display(metadata_df)
-
-# Save DataFrame as a Table for Future Use
-# metadata_df.write.format("delta").mode("overwrite").saveAsTable("metadata.asset_details")
-
-# print("✅ Metadata successfully stored in `metadata.asset_details`.")
-
-
-# COMMAND ----------
-
-from pyspark.sql.functions import col, broadcast
-from pyspark.sql.utils import AnalysisException
-
-# Function to safely load system tables
-def load_system_table(table_name):
-    """Safely loads a system information schema table."""
-    try:
-        df = spark.sql(f"SELECT * FROM system.information_schema.{table_name}")
-        print(f"✅ Loaded {table_name}")
-        df.printSchema()  # Debugging: Print schema
-        return df
-    except AnalysisException:
-        print(f"❌ Table system.information_schema.{table_name} not found. Skipping...")
-        return None
-
-# Load metadata tables
-catalogs_df = load_system_table("catalogs")
-catalog_tags_df = load_system_table("catalog_tags")
-schemata_df = load_system_table("schemata")
-schema_tags_df = load_system_table("schema_tags")
-tables_df = load_system_table("tables")
-table_tags_df = load_system_table("table_tags")
-columns_df = load_system_table("columns")
-column_tags_df = load_system_table("column_tags")
-
-# Ensure required tables are loaded
-if not all([catalogs_df, schemata_df, tables_df, columns_df]):
-    print("❌ Critical metadata tables are missing. Aborting process.")
-    exit()
-
-if "table_catalog" in columns_df.columns:
-    columns_df = columns_df.withColumnRenamed("table_catalog", "catalog_name")
-
-if "table_catalog" in tables_df.columns:
-    tables_df = tables_df.withColumnRenamed("table_catalog", "catalog_name")
-
-if "table_catalog" in schemata_df.columns:
-    schemata_df = schemata_df.withColumnRenamed("table_catalog", "catalog_name")
-
-
-# Join columns with column_tags
-if column_tags_df:
-    columns_df = columns_df.join(broadcast(column_tags_df), ["column_name"], "left")
-
-# Join tables with table_tags
-if table_tags_df:
-    tables_df = tables_df.join(broadcast(table_tags_df), ["table_name"], "left")
-
-# Join columns with tables
-metadata_df = columns_df.join(tables_df, ["table_name", "schema_name", "catalog_name"], "left")
-
-# Join schemata with schema_tags
-if schema_tags_df:
-    schemata_df = schemata_df.join(broadcast(schema_tags_df), ["schema_name"], "left")
-
-# Join metadata with schemata
-metadata_df = metadata_df.join(schemata_df, ["schema_name", "catalog_name"], "left")
-
-# Join catalogs with catalog_tags
-if catalog_tags_df:
-    catalogs_df = catalogs_df.join(broadcast(catalog_tags_df), ["catalog_name"], "left")
-
-# Join metadata with catalogs
-metadata_df = metadata_df.join(catalogs_df, ["catalog_name"], "left")
-
-# Drop duplicates (if needed)
-metadata_df = metadata_df.dropDuplicates()
-
-# Display results
-display(metadata_df)
-
-
-# COMMAND ----------
-
 # Assets name, Assets owner, Assets description/comments Data Stewards, Tags (domain/category, confidentiality, sensitive data types, PII/PCI, business glossary association …)
 from pyspark.sql.functions import col, broadcast
 from pyspark.sql.utils import AnalysisException
@@ -376,13 +211,13 @@ def load_system_table(table_name, prefix):
     """Safely loads a system information schema table and adds a prefix to all columns."""
     try:
         df = spark.sql(f"SELECT * FROM system.information_schema.{table_name}")
-        print(f"✅ Loaded {table_name}")
+        print(f"Loaded {table_name}")
         # Add prefix to columns
         df = df.select([col(c).alias(f"{prefix}_{c}") for c in df.columns])
         df.printSchema()
         return df
     except AnalysisException:
-        print(f"❌ Table system.information_schema.{table_name} not found. Skipping...")
+        print(f"Table system.information_schema.{table_name} not found. Skipping...")
         return None
 
 # Load metadata tables with aliases
@@ -397,22 +232,22 @@ column_tags_df = load_system_table("column_tags", "column_tags")
 
 # Ensure required tables are loaded
 if not all([catalogs_df, schemata_df, tables_df, columns_df]):
-    print("❌ Critical metadata tables are missing. Aborting process.")
+    print("Critical metadata tables are missing. Aborting process.")
     exit()
 
-# 🟢 Fix: Join column_tags with columns using correct alias (`columns_column_name`)
+# Join column_tags with columns using correct alias (`columns_column_name`)
 if column_tags_df:
     columns_df = columns_df.join(
         broadcast(column_tags_df), columns_df["columns_column_name"] == column_tags_df["column_tags_column_name"], "left"
     )
 
-# 🟢 Join table_tags with tables
+# Join table_tags with tables
 if table_tags_df:
     tables_df = tables_df.join(
         broadcast(table_tags_df), tables_df["tables_table_name"] == table_tags_df["table_tags_table_name"], "left"
     )
 
-# 🟢 Join columns with tables
+# Join columns with tables
 metadata_df = columns_df.join(
     tables_df,
     (columns_df["columns_table_name"] == tables_df["tables_table_name"]) &
@@ -420,13 +255,13 @@ metadata_df = columns_df.join(
     (columns_df["columns_table_catalog"] == tables_df["tables_table_catalog"]),
     "left"
 )
-# 🟢 Join schema_tags with schemata
+# Join schema_tags with schemata
 if schema_tags_df:
     schemata_df = schemata_df.join(
         broadcast(schema_tags_df), schemata_df["schemata_schema_name"] == schema_tags_df["schema_tags_schema_name"], "left"
     )
 
-# 🟢 Join metadata with schemata
+# Join metadata with schemata
 metadata_df = metadata_df.join(
     schemata_df,
     (metadata_df["columns_table_schema"] == schemata_df["schemata_schema_name"]) &
@@ -434,23 +269,23 @@ metadata_df = metadata_df.join(
     "left"
 )
 
-# 🟢 Join catalog_tags with catalogs
+# Join catalog_tags with catalogs
 if catalog_tags_df:
     catalogs_df = catalogs_df.join(
         broadcast(catalog_tags_df), catalogs_df["catalogs_catalog_name"] == catalog_tags_df["catalog_tags_catalog_name"], "left"
     )
 
-# 🟢 Join metadata with catalogs
+# Join metadata with catalogs
 metadata_df = metadata_df.join(
     catalogs_df,
     metadata_df["columns_table_catalog"] == catalogs_df["catalogs_catalog_name"],
     "left"
 ).drop("columns_table_catalog", "columns_table_schema", "columns_table_catalog", "tables_table_schema", "tables_table_catalog", "schema_tags_catalog_name", "schema_tags_schema_name", "schemata_catalog_name", "columns_table_catalog", "catalog_tags_catalog_name", "table_tags_catalog_name", "table_tags_schema_name", "table_tags_table_name", "column_tags_catalog_name", "column_tags_schema_name", "column_tags_table_name", "column_tags_column_name")
 
-# ✅ Drop duplicates (if needed)
+# Drop duplicates (if needed)
 metadata_df = metadata_df.dropDuplicates()
 
-# ✅ Final Column Selection (Correct Order)
+# Final Column Selection (Correct Order)
 metadata_df = metadata_df.select(
     # Catalogs First
     col("catalogs_catalog_name").alias("catalog_name"),
@@ -478,20 +313,76 @@ metadata_df = metadata_df.select(
     "column_tags_tag_name", "column_tags_tag_value"
 )
 
-# ✅ Display results
+# Display results
 display(metadata_df)
 
+TARGET_CATALOG = "coe_system"
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+metadata_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.asset_details")
+
+print("Metadata successfully stored in `metadata.asset_details`.")
+
 
 # COMMAND ----------
 
-# Data Stewards, Tags (domain/category, confidentiality, sensitive data types, PII/PCI, business glossary association …)
+# size of asssets (in GB/MB total)
+from pyspark.sql.functions import col
+from pyspark.sql.utils import AnalysisException
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-df_column_tags = spark.table("system.information_schema.column_tags")
-display(df_column_tags)
+# Read existing metadata table
+asset_details_df = spark.sql("SELECT * FROM coe_system.metadata.asset_details")
 
-# COMMAND ----------
+# Function to process a single table and fetch its size details
+def get_table_size(row):
+    catalog_name = row["catalog_name"]
+    schema_name = row["schema_name"]
+    table_name = row["table_name"]
+    full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
+    
+    try:
+        # Run DESCRIBE DETAIL to get metadata
+        detail_df = spark.sql(f"DESCRIBE DETAIL {full_table_name}")
+        detail_row = detail_df.collect()[0]  # Fetch the first (and only) row
 
-# size of asssets (in GB/MB tota)
+        # Extract size in bytes and calculate GB and MB
+        size_in_bytes = detail_row["sizeInBytes"]
+        size_in_gb = round(size_in_bytes / (1024 ** 3), 3)  # Convert to GB
+        size_in_mb = round(size_in_bytes / (1024 ** 2), 3)  # Convert to MB
+
+        return (catalog_name, schema_name, table_name, size_in_bytes, size_in_gb, size_in_mb)
+
+    except AnalysisException:
+        print(f"❌ Table {full_table_name} not found. Skipping...")
+    except Exception as e:
+        print(f"⚠️ Error processing {full_table_name}: {str(e)}")
+    
+    return None  # Return None for skipped/error cases
+
+# Initialize ThreadPoolExecutor
+table_metadata_list = []
+with ThreadPoolExecutor(max_workers=8) as executor:  # Adjust the number of workers based on cluster capacity
+    future_to_table = {executor.submit(get_table_size, row): row for row in asset_details_df.collect()}
+    
+    for future in as_completed(future_to_table):
+        result = future.result()
+        if result:
+            table_metadata_list.append(result)
+
+# Convert list to DataFrame
+columns = ["catalog_name", "schema_name", "table_name", "size_in_bytes", "size_in_gb", "size_in_mb"]
+size_df = spark.createDataFrame(table_metadata_list, columns)
+
+# Join with original asset details
+final_asset_details_df = asset_details_df.join(size_df, ["catalog_name", "schema_name", "table_name"], "left")
+
+# Display final DataFrame
+display(final_asset_details_df)
+
 
 # COMMAND ----------
 
