@@ -7,14 +7,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # COMMAND ----------
 
-dbutils.widgets.text("TARGET_CATALOG", "coe_system")
+dbutils.widgets.text("SOURCE_CATALOG", "system")
+dbutils.widgets.text("TARGET_CATALOG", "cog_land_system")
+dbutils.widgets.text("INFO_SCHEMA_TARGET", "cog_information_schema")
+dbutils.widgets.text("EXCLUDED_SCHEMAS", "ai")
+dbutils.widgets.text("EXCLUDED_TABLES", "_sqldf,__internal_logging")
+
+SOURCE_CATALOG = dbutils.widgets.get("SOURCE_CATALOG")
 TARGET_CATALOG = dbutils.widgets.get("TARGET_CATALOG")
+INFO_SCHEMA_TARGET = dbutils.widgets.get("INFO_SCHEMA_TARGET")
+EXCLUDED_SCHEMAS = set(dbutils.widgets.get("EXCLUDED_SCHEMAS").split(","))
+EXCLUDED_TABLES = set(dbutils.widgets.get("EXCLUDED_TABLES").split(","))
 
 # COMMAND ----------
 
 # Load the data from the table
-df = spark.table("system.access.audit")
-df_billing_usage = spark.table("system.billing.usage")
+df = spark.table(f"{SOURCE_CATALOG}.access.audit")
+df_billing_usage = spark.table(f"{SOURCE_CATALOG}.billing.usage")
 
 # Get distinct values
 distinct_account_ids = df.select("account_id").distinct()
@@ -48,7 +57,7 @@ payload = {
     "client_id": CLIENT_ID,
     "client_secret": CLIENT_SECRET,
     "scope": "all-apis",  # Required for access to all APIs
-    "lifetime_seconds": 3600,  # Token expires in 1 hour
+    "lifetime_seconds": 7200,  # Token expires in 2 hours
     "comment": "Workspace token for Service Principal"
 }
 
@@ -71,6 +80,29 @@ else:
 
 # COMMAND ----------
 
+from pyspark.sql.types import StructType, StructField, StringType, LongType, MapType, TimestampType
+from pyspark.sql.functions import col, from_unixtime
+
+# Define the schema for the JSON response
+schema = StructType([
+    StructField("account_id", StringType(), False),
+    StructField("azure_workspace_info", MapType(StringType(), StringType(), True)),
+    StructField("creation_time", LongType(), False),  # Keep as LongType to parse as timestamp later
+    StructField("deployment_name", StringType(), True),
+    StructField("identity_federation_info", StringType(), True),
+    StructField("location", StringType(), True),
+    StructField("pricing_tier", StringType(), True),
+    StructField("workspace_id", LongType(), False),
+    StructField("workspace_name", StringType(), True),
+    StructField("workspace_status", StringType(), True),
+    StructField("workspace_status_message", StringType(), True),
+    StructField("network_connectivity_config_id", StringType(), True)
+    # StructField("private_access_settings_id", StringType(), True),
+    # StructField("storage_customer_managed_key_id", StringType(), True),
+    # StructField("credentials_id", StringType(), True),
+    # StructField("storage_configuration_id", StringType(), True),
+])
+
 # Run in sharing accounts
 # Account region/location (e.g. US-East2)
 # API endpoint to fetch all workspaces
@@ -91,8 +123,30 @@ response = requests.get(api_endpoint, headers=headers)
 # Store the results in a Spark DataFrame
 if response.status_code == 200:
     response_json = response.json()
-    workspaces_data = spark.createDataFrame(response_json)
-    display(workspaces_data)
+    workspaces_data = spark.createDataFrame(response_json, schema=schema)
+    
+    # Alias the resulting column names and cast creation_time to timestamp
+    aliased_workspaces_data = workspaces_data.select(
+        col("account_id"),
+        col("azure_workspace_info").alias("workspace_info"),
+        from_unixtime(col("creation_time") / 1000).cast(TimestampType()).alias("creation_time"),
+        col("deployment_name"),
+        col("identity_federation_info"),
+        col("location"),
+        col("pricing_tier"),
+        col("workspace_id"),
+        col("workspace_name"),
+        col("workspace_status"),
+        col("workspace_status_message"),
+        col("network_connectivity_config_id")
+        # col("credentials_id").alias("credentials"),
+        # col("storage_configuration_id"),
+        # col("managed_services_customer_managed_key_id"),
+        # col("private_access_settings_id"),
+        # col("storage_customer_managed_key_id")
+    )
+
+    display(aliased_workspaces_data)
 else:
     print(f"Error fetching workspaces: {response.status_code} - {response.text}")
 
@@ -101,19 +155,19 @@ else:
 # Data Inventory Overview
     # List of Databricks accounts mapped to the applications
     # Cloud provider (AWS/Azure)
-query = """
+query = f"""
 SELECT DISTINCT 
     account_id, 
     workspace_id, 
     cloud
-FROM system.billing.usage
+FROM {TARGET_CATALOG}.billing.usage
 """
 data_inventory_df = spark.sql(query)
 display(data_inventory_df)
 
 # COMMAND ----------
 
-data_inventory_overview = workspaces_data.join(data_inventory_df, on=["account_id", "workspace_id"], how="full")
+data_inventory_overview = aliased_workspaces_data.join(data_inventory_df, on=["account_id", "workspace_id"], how="inner")
 
 data_inventory_overview = data_inventory_overview.withColumn(
     "deployment_url",
@@ -205,126 +259,14 @@ print(f"Total distinct users: {total_users}")
 def load_system_table(table_name, prefix):
     """Safely loads a system information schema table and adds a prefix to all columns."""
     try:
-        df = spark.sql(f"SELECT * FROM system.information_schema.{table_name}")
-        print(f"Loaded {table_name}")
-        # Add prefix to columns
-        df = df.select([col(c).alias(f"{prefix}_{c}") for c in df.columns])
-        df.printSchema()
-        return df
-    except AnalysisException:
-        print(f"Table system.information_schema.{table_name} not found. Skipping...")
-        return None
-
-# Load metadata tables with aliases
-catalogs_df = load_system_table("catalogs", "catalogs")
-catalog_tags_df = load_system_table("catalog_tags", "catalog_tags")
-schemata_df = load_system_table("schemata", "schemata")
-schema_tags_df = load_system_table("schema_tags", "schema_tags")
-tables_df = load_system_table("tables", "tables")
-table_tags_df = load_system_table("table_tags", "table_tags")
-columns_df = load_system_table("columns", "columns")
-column_tags_df = load_system_table("column_tags", "column_tags")
-
-# Ensure required tables are loaded
-if not all([catalogs_df, schemata_df, tables_df, columns_df]):
-    print("Critical metadata tables are missing. Aborting process.")
-    exit()
-
-# Join column_tags with columns using correct alias (`columns_column_name`)
-if column_tags_df:
-    columns_df = columns_df.join(
-        broadcast(column_tags_df), columns_df["columns_column_name"] == column_tags_df["column_tags_column_name"], "left"
-    )
-
-# Join table_tags with tables
-if table_tags_df:
-    tables_df = tables_df.join(
-        broadcast(table_tags_df), tables_df["tables_table_name"] == table_tags_df["table_tags_table_name"], "left"
-    )
-
-# Join columns with tables
-metadata_df = columns_df.join(
-    tables_df,
-    (columns_df["columns_table_name"] == tables_df["tables_table_name"]) &
-    (columns_df["columns_table_schema"] == tables_df["tables_table_schema"]) &
-    (columns_df["columns_table_catalog"] == tables_df["tables_table_catalog"]),
-    "left"
-)
-# Join schema_tags with schemata
-if schema_tags_df:
-    schemata_df = schemata_df.join(
-        broadcast(schema_tags_df), schemata_df["schemata_schema_name"] == schema_tags_df["schema_tags_schema_name"], "left"
-    )
-
-# Join metadata with schemata
-metadata_df = metadata_df.join(
-    schemata_df,
-    (metadata_df["columns_table_schema"] == schemata_df["schemata_schema_name"]) &
-    (metadata_df["columns_table_catalog"] == schemata_df["schemata_catalog_name"]),
-    "left"
-)
-
-# Join catalog_tags with catalogs
-if catalog_tags_df:
-    catalogs_df = catalogs_df.join(
-        broadcast(catalog_tags_df), catalogs_df["catalogs_catalog_name"] == catalog_tags_df["catalog_tags_catalog_name"], "left"
-    )
-
-# Join metadata with catalogs
-metadata_df = metadata_df.join(
-    catalogs_df,
-    metadata_df["columns_table_catalog"] == catalogs_df["catalogs_catalog_name"],
-    "left"
-).drop("columns_table_catalog", "columns_table_schema", "columns_table_catalog", 
-       "tables_table_schema", "tables_table_catalog", "schema_tags_catalog_name", "schema_tags_schema_name", "schemata_catalog_name", "columns_table_catalog", "catalog_tags_catalog_name", "table_tags_catalog_name", "table_tags_schema_name", "table_tags_table_name", "column_tags_catalog_name", "column_tags_schema_name", "column_tags_table_name", "column_tags_column_name")
-
-# Drop duplicates (if needed)
-metadata_df = metadata_df.dropDuplicates()
-
-# Final Column Selection (Correct Order)
-metadata_df = metadata_df.select(
-# Catalogs First
-    col("catalogs_catalog_name").alias("catalog_name"),
-    "catalogs_catalog_owner", "catalogs_comment", "catalogs_created", 
-    "catalogs_created_by", "catalogs_last_altered", "catalogs_last_altered_by", 
-    "catalog_tags_tag_name", "catalog_tags_tag_value",
-# Schemas Second
-    col("schemata_schema_name").alias("schema_name"),
-    "schemata_schema_owner", "schemata_comment", "schemata_created", 
-    "schemata_created_by", "schemata_last_altered", "schemata_last_altered_by",
-    "schema_tags_tag_name", "schema_tags_tag_value",
-# Tables Third
-    col("tables_table_name").alias("table_name"),
-    "tables_table_owner", "tables_table_type", "tables_comment", "tables_created",
-    "tables_created_by", "tables_last_altered", "tables_last_altered_by",
-    "table_tags_tag_name", "table_tags_tag_value",
-# Columns Last
-    col("columns_column_name").alias("column_name"),
-    "columns_data_type", "columns_comment", "columns_is_nullable", 
-    "columns_character_maximum_length", "columns_numeric_precision", 
-    "columns_numeric_scale", "columns_datetime_precision",
-    "column_tags_tag_name", "column_tags_tag_value"
-)
-
-# Display results
-display(metadata_df)
-
-
-# COMMAND ----------
-
-# Assets name, Assets owner, Assets description/comments Data Stewards, Tags (domain/category, confidentiality, sensitive data types, PII/PCI, business glossary association …)
-# Function to safely load system tables with prefixed column names
-def load_system_table(table_name, prefix):
-    """Safely loads a system information schema table and adds a prefix to all columns."""
-    try:
-        df = spark.sql(f"SELECT * FROM system.information_schema.{table_name}")
+        df = spark.sql(f"SELECT * FROM {SOURCE_CATALOG}.information_schema.{table_name}")
         print(f"✅ Loaded {table_name}")
         # Add prefix to columns
         df = df.select([col(c).alias(f"{prefix}_{c}") for c in df.columns])
         df.printSchema()
         return df
     except AnalysisException:
-        print(f"❌ Table system.information_schema.{table_name} not found. Skipping...")
+        print(f"❌ Table {SOURCE_CATALOG}.information_schema.{table_name} not found. Skipping...")
         return None
 
 # Load metadata tables with aliases
@@ -481,67 +423,18 @@ metadata_df = metadata_df.select(
 # Display results
 display(metadata_df)
 
-
 # COMMAND ----------
 
-# size of asssets (in GB/MB total)
-# Read existing metadata table
-# asset_details_df = spark.sql("SELECT * FROM coe_system.metadata.asset_details")
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.functions import col
+from pyspark.sql.utils import AnalysisException
+
+# Exclude `information_schema` from processing
 asset_details_df = metadata_df
-
-# Function to process a single table and fetch its size details
-def get_table_size(row):
-    catalog_name = row["catalog_name"]
-    schema_name = row["schema_name"]
-    table_name = row["table_name"]
-    full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
-    
-    try:
-        # Run DESCRIBE DETAIL to get metadata
-        detail_df = spark.sql(f"DESCRIBE DETAIL {full_table_name}")
-        detail_row = detail_df.collect()[0]  # Fetch the first (and only) row
-
-        # Extract size in bytes and calculate GB and MB
-        size_in_bytes = detail_row["sizeInBytes"]
-        size_in_gb = round(size_in_bytes / (1024 ** 3), 3)  # Convert to GB
-        size_in_mb = round(size_in_bytes / (1024 ** 2), 3)  # Convert to MB
-
-        return (catalog_name, schema_name, table_name, size_in_bytes, size_in_gb, size_in_mb)
-
-    except AnalysisException:
-        print(f"❌ Table {full_table_name} not found. Skipping...")
-    except Exception as e:
-        print(f"⚠️ Error processing {full_table_name}: {str(e)}")
-    
-    return None  # Return None for skipped/error cases
-
-# Initialize ThreadPoolExecutor
-table_metadata_list = []
-with ThreadPoolExecutor(max_workers=8) as executor:  # Adjust the number of workers based on cluster capacity
-    future_to_table = {executor.submit(get_table_size, row): row for row in asset_details_df.collect()}
-    
-    for future in as_completed(future_to_table):
-        result = future.result()
-        if result:
-            table_metadata_list.append(result)
-
-# Convert list to DataFrame
-columns = ["catalog_name", "schema_name", "table_name", "size_in_bytes", "size_in_gb", "size_in_mb"]
-size_df = spark.createDataFrame(table_metadata_list, columns)
-
-# Join with original asset details
-final_asset_details_df = asset_details_df.join(size_df, ["catalog_name", "schema_name", "table_name"], "left")
-
-# Display final DataFrame
-display(final_asset_details_df)
-
-
-# COMMAND ----------
-
-# size of asssets (in GB/MB total)
-# Read existing metadata table
-# asset_details_df = spark.sql("SELECT * FROM coe_system.metadata.asset_details")
-asset_details_df = metadata_df
+filtered_asset_details_df = asset_details_df.filter(
+    (col("schema_name") != "information_schema") & 
+    (~col("catalog_name").startswith("__databricks_internal")))
 
 # Function to process a single table and fetch its size details + row count
 def get_table_metadata(row):
@@ -555,8 +448,12 @@ def get_table_metadata(row):
         detail_df = spark.sql(f"DESCRIBE DETAIL {full_table_name}")
         detail_row = detail_df.collect()[0]  # Fetch the first (and only) row
 
-        # Extract size in bytes and calculate GB and MB
+        # Extract size in bytes (handle NoneType)
         size_in_bytes = detail_row["sizeInBytes"]
+        if size_in_bytes is None:
+            size_in_bytes = 0  # Set to 0 if None
+
+        # Convert to GB and MB safely
         size_in_gb = round(size_in_bytes / (1024 ** 3), 3)  # Convert to GB
         size_in_mb = round(size_in_bytes / (1024 ** 2), 3)  # Convert to MB
 
@@ -575,7 +472,7 @@ def get_table_metadata(row):
 # Initialize ThreadPoolExecutor
 table_metadata_list = []
 with ThreadPoolExecutor(max_workers=8) as executor:  # Adjust workers based on cluster capacity
-    future_to_table = {executor.submit(get_table_metadata, row): row for row in asset_details_df.collect()}
+    future_to_table = {executor.submit(get_table_metadata, row): row for row in filtered_asset_details_df.collect()}
     
     for future in as_completed(future_to_table):
         result = future.result()
@@ -587,11 +484,10 @@ columns = ["catalog_name", "schema_name", "table_name", "size_in_bytes", "size_i
 metadata_df = spark.createDataFrame(table_metadata_list, columns)
 
 # Join with original asset details
-final_asset_details_df = asset_details_df.join(metadata_df, ["catalog_name", "schema_name", "table_name"], "left")
+final_asset_details_df = filtered_asset_details_df.join(metadata_df, ["catalog_name", "schema_name", "table_name"], "left")
 
 # Display final DataFrame
 display(final_asset_details_df)
-
 
 # COMMAND ----------
 
@@ -602,6 +498,10 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 final_asset_details_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.asset_details")
 
 print("Metadata successfully stored in `metadata.asset_details`.")
+
+# COMMAND ----------
+
+#
 
 # COMMAND ----------
 
