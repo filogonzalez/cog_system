@@ -5,8 +5,10 @@
 # COMMAND ----------
 
 import requests
-import json
-from pyspark.sql.functions import collect_set, concat, lit, when, col, explode, broadcast
+from pyspark.sql.types import (MapType, StringType, IntegerType, LongType, TimestampType, 
+                               DateType, DecimalType, BinaryType, StructType, StructField)
+from pyspark.sql.functions import (collect_set, concat, lit, when, col, explode, broadcast, 
+                                   collect_list, map_entries, udf, map_keys, from_unixtime)
 from pyspark.sql.utils import AnalysisException
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -96,9 +98,6 @@ else:
 # COMMAND ----------
 
 # AZURE API
-from pyspark.sql.types import StructType, StructField, StringType, LongType, MapType, TimestampType
-from pyspark.sql.functions import col, from_unixtime
-
 # Define the schema for the JSON response
 schema = StructType([
     StructField("account_id", StringType(), False),
@@ -456,10 +455,6 @@ display(metadata_df)
 
 # COMMAND ----------
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pyspark.sql.functions import col
-from pyspark.sql.utils import AnalysisException
-
 # **Filter out `information_schema` and system views**
 filtered_asset_details_df = metadata_df.filter(
     (col("schema_name") != "information_schema") & 
@@ -542,10 +537,6 @@ else:
 
 
 # COMMAND ----------
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pyspark.sql.functions import col, collect_list, map_entries
-from pyspark.sql.utils import AnalysisException
 
 # **Filter out `information_schema` and system views**
 filtered_asset_details_df = metadata_df.filter(
@@ -648,19 +639,11 @@ print("Metadata successfully stored in `metadata.asset_details`.")
 
 # COMMAND ----------
 
-import requests
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import udf, col, map_keys, explode
-from pyspark.sql.types import MapType, StringType
-
-# Initialize Spark session
-spark = SparkSession.builder.appName("ClusterInfoRetrieval").getOrCreate()
-
 # Define the access token (ensure this is securely managed)
 ACCESS_TOKEN = f"{ACCESS_TOKEN}"
 
 # Read the clusters table into a DataFrame
-clusters_df = spark.table("cog_land_system.compute.clusters")
+clusters_df = spark.table(f"{SOURCE_CATALOG}.compute.clusters")
 
 # Select distinct cluster_id and workspace_id values
 distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
@@ -671,7 +654,7 @@ joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id"
 
 # Define a function to call the Databricks REST API
 def get_cluster_info(workspace_url, cluster_id):
-    endpoint = f"{workspace_url}/api/2.0/clusters/get?cluster_id={cluster_id}"
+    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     try:
         response = requests.get(endpoint, headers=headers)
@@ -697,7 +680,7 @@ for key in keys_list:
     result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
 
 # Select relevant columns
-filtered_df = result_df.select( "workspace_id", "deployment_url", "cluster_id", *keys_list)
+filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
 
 # Remove rows where cluster_id is null
 cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
@@ -708,6 +691,331 @@ display(cluster_info_id_df)
 
 # COMMAND ----------
 
+import requests
+from pyspark.sql.functions import col, lit, udf, explode, map_keys
+from pyspark.sql.types import MapType, StringType
+
+# Read the clusters table into a DataFrame
+clusters_df = spark.table(f"{SOURCE_CATALOG}.compute.clusters")
+
+# Select distinct cluster_id and workspace_id values
+distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
+
+# Assume data_inventory_overview is already available as a DataFrame
+# Join distinct cluster IDs with data_inventory_overview to get workspace details
+joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
+
+# Define a function to call the Databricks REST API to get cluster info
+def get_cluster_info(workspace_url, cluster_id):
+    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"Status code {response.status_code}: {response.text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Register the function as a UDF
+get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
+
+# Add a column with cluster information from the API
+result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
+
+# Extract keys from the cluster_info map
+keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
+keys_list = [row[0] for row in keys_df.collect()]
+
+# Add the policy_id column with a default value if it's missing
+if 'policy_id' not in keys_list:
+    result_df = result_df.withColumn('policy_id', lit(None))
+
+# Create columns for each key in cluster_info
+for key in keys_list:
+    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
+
+# Select relevant columns
+filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
+
+# Remove rows where cluster_id is null
+cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
+
+# Define a function to call the Databricks REST API to get policy info
+def get_policy_info(workspace_url, policy_id, access_token):
+    if not policy_id:
+        return {"policy_id": None, "name": None, "definition": None, "description": None}
+    endpoint = f"{workspace_url}/api/2.0/policies/clusters/get?policy_id={policy_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"Status code {response.status_code}: {response.text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# Register the function as a UDF
+get_policy_info_udf = udf(get_policy_info, MapType(StringType(), StringType()))
+
+# Add a column with policy information from the API
+final_df = cluster_info_id_df.withColumn("policy_info", get_policy_info_udf(col("deployment_url"), col("policy_id")))
+
+# Extract policy_name from the policy_info map
+final_df = final_df.withColumn("policy_name", col("policy_info").getItem("policy_name"))
+
+# Select relevant columns
+final_df = final_df #.select("workspace_id", "deployment_url", "cluster_id", "cluster_name", "policy_id", "policy_name")
+
+# Display the resulting DataFrame
+display(final_df)
+
+
+# COMMAND ----------
+
+import requests
+from pyspark.sql.functions import col, lit, udf, explode, map_keys
+from pyspark.sql.types import MapType, StringType
+
+# Define the access token (ensure this is securely managed)
+ACCESS_TOKEN = f"{ACCESS_TOKEN}"
+
+# Read the clusters table into a DataFrame
+clusters_df = spark.table("cog_land_system.compute.clusters")
+
+# Select distinct cluster_id and workspace_id values
+distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
+
+# Assume data_inventory_overview is already available as a DataFrame
+# Join distinct cluster IDs with data_inventory_overview to get workspace details
+joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
+
+# Define a function to call the Databricks REST API to get cluster info
+def get_cluster_info(workspace_url, cluster_id):
+    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"Status code {response.status_code}: {response.text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Register the function as a UDF
+get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
+
+# Add a column with cluster information from the API
+result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
+
+# Extract keys from the cluster_info map
+keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
+keys_list = [row[0] for row in keys_df.collect()]
+
+# Add the policy_id column with a default value if it's missing
+if 'policy_id' not in keys_list:
+    result_df = result_df.withColumn('policy_id', lit(None))
+
+# Create columns for each key in cluster_info
+for key in keys_list:
+    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
+
+# Select relevant columns
+filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
+
+# Remove rows where cluster_id is null
+cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
+
+# Define a function to call the Databricks REST API to get policy info
+def get_policy_info(workspace_url, policy_id):
+    if policy_id is None:
+        return {"policy_name": None, "policy_definition": None, "policy_description": None}
+    endpoint = f"{workspace_url}/api/2.0/policies/clusters/get?policy_id={policy_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            policy_info = response.json()
+            return {
+                "policy_name": policy_info.get("name", None),
+                "policy_definition": policy_info.get("definition", None),
+                "policy_description": policy_info.get("description", None)
+            }
+        else:
+            return {"policy_name": None, "policy_definition": None, "policy_description": None}
+    except Exception as e:
+        return {"policy_name": None, "policy_definition": None, "policy_description": None}
+
+# Register the function as a UDF
+get_policy_info_udf = udf(get_policy_info, MapType(StringType(), StringType()))
+
+# Add a column with policy information from the API
+final_df = cluster_info_id_df.withColumn("policy_info", get_policy_info_udf(col("deployment_url"), col("policy_id")))
+
+# Extract policy_name, policy_definition, and policy_description from the policy_info map
+final_df = final_df.withColumn("policy_name", col("policy_info").getItem("policy_name"))
+final_df = final_df.withColumn("policy_definition", col("policy_info").getItem("policy_definition"))
+final_df = final_df.withColumn("policy_description", col("policy_info").getItem("policy_description"))
+
+# Select relevant columns
+# final_df = final_df.select("workspace_id", "deployment_url", "cluster_id", "cluster_name", "policy_id", "policy_name", "policy_definition", "policy_description")
+
+# Display the resulting DataFrame
+display(final_df)
+
+
+# COMMAND ----------
+
+import requests
+from pyspark.sql.functions import col, lit, udf, explode, map_keys
+from pyspark.sql.types import MapType, StringType, IntegerType, BooleanType, ArrayType
+
+# Define the access token (ensure this is securely managed)
+ACCESS_TOKEN = f"{ACCESS_TOKEN}"
+
+# Read the clusters table into a DataFrame
+clusters_df = spark.table(f"{SOURCE_CATALOG}.compute.clusters")
+
+# Select distinct cluster_id and workspace_id values
+distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
+
+# Assume data_inventory_overview is already available as a DataFrame
+# Join distinct cluster IDs with data_inventory_overview to get workspace details
+joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
+
+# Define a function to call the Databricks REST API to get cluster info
+def get_cluster_info(workspace_url, cluster_id):
+    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"Status code {response.status_code}: {response.text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Register the function as a UDF
+get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
+
+# Add a column with cluster information from the API
+result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
+
+# Extract keys from the cluster_info map
+keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
+keys_list = [row[0] for row in keys_df.collect()]
+
+# Add the policy_id column with a default value if it's missing
+if 'policy_id' not in keys_list:
+    result_df = result_df.withColumn('policy_id', lit(None))
+
+# Create columns for each key in cluster_info
+for key in keys_list:
+    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
+
+# Select relevant columns
+filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
+
+# Remove rows where cluster_id is null
+cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
+
+# Define a function to call the Databricks REST API to get policy info
+def get_policy_info(workspace_url, policy_id):
+    if policy_id is None:
+        return {
+            "policy_name": None,
+            "policy_definition": None,
+            "policy_description": None,
+            "max_clusters_per_user": None,
+            "libraries": None,
+            "creator_user_name": None,
+            "created_at_timestamp": None,
+            "is_default": None
+        }
+    endpoint = f"{workspace_url}/api/2.0/policies/clusters/get?policy_id={policy_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            policy_info = response.json()
+            return {
+                "policy_name": policy_info.get("name", None),
+                "policy_definition": policy_info.get("definition", None),
+                "policy_description": policy_info.get("description", None),
+                "max_clusters_per_user": policy_info.get("max_clusters_per_user", None),
+                "libraries": policy_info.get("libraries", None),
+                "creator_user_name": policy_info.get("creator_user_name", None),
+                "created_at_timestamp": policy_info.get("created_at_timestamp", None),
+                "is_default": policy_info.get("is_default", None)
+            }
+        else:
+            return {
+                "policy_name": None,
+                "policy_definition": None,
+                "policy_description": None,
+                "max_clusters_per_user": None,
+                "libraries": None,
+                "creator_user_name": None,
+                "created_at_timestamp": None,
+                "is_default": None
+            }
+    except Exception as e:
+        return {
+            "policy_name": None,
+            "policy_definition": None,
+            "policy_description": None,
+            "max_clusters_per_user": None,
+            "libraries": None,
+            "creator_user_name": None,
+            "created_at_timestamp": None,
+            "is_default": None
+        }
+
+# Register the function as a UDF
+get_policy_info_udf = udf(get_policy_info, MapType(StringType(), StringType()))
+
+# Add a column with policy information from the API
+final_df = cluster_info_id_df.withColumn("policy_info", get_policy_info_udf(col("deployment_url"), col("policy_id")))
+
+# Extract policy fields from the policy_info map
+policy_fields = [
+    "policy_name",
+    "policy_definition",
+    "policy_description",
+    "max_clusters_per_user",
+    "libraries",
+    "creator_user_name",
+    "created_at_timestamp",
+    "is_default"
+]
+
+for field in policy_fields:
+    final_df = final_df.withColumn(field, col("policy_info").getItem(field))
+
+# Select relevant columns
+final_df = final_df#.select(
+#     "workspace_id",
+#     "deployment_url",
+#     "cluster_id",
+#     "cluster_name",
+#     "policy_id",
+#     "policy_name",
+#     "policy_definition",
+#     "policy_description",
+#     "max_clusters_per_user",
+#     "libraries",
+#     "creator_user_name",
+#     "created_at_timestamp",
+#     "is_default"
+# )
+
+# Display the resulting DataFrame
+display(final_df)
 
 
 # COMMAND ----------
