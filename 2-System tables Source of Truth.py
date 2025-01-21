@@ -2,7 +2,7 @@
 dbutils.widgets.text("SOURCE_CATALOG", "system")
 dbutils.widgets.text("OBJECTIVE_CATALOG", "cog_system")
 dbutils.widgets.text("INFO_SCHEMA_TARGET", "cog_information_schema")
-dbutils.widgets.text("EXCLUDED_SCHEMAS", "ai")
+dbutils.widgets.text("EXCLUDED_SCHEMAS", "information_schema", "ai")
 dbutils.widgets.text("EXCLUDED_TABLES", "_sqldf,__internal_logging")
 
 SOURCE_CATALOG = dbutils.widgets.get("SOURCE_CATALOG")
@@ -220,7 +220,8 @@ if __name__ == "__main__":
 
 # COMMAND ----------
 
-Error processing table fg_wp_aws_cog_system.access.table_lineage: (com.databricks.backend.daemon.data.client.DatabricksRemoteException) BAD_REQUEST: Databricks Default Storage cannot be accessed using Classic Compute. Please use Serverless compute to access data in Default Storage
+# MAGIC %md
+# MAGIC # Unit Testing
 
 # COMMAND ----------
 
@@ -305,6 +306,22 @@ for schema_name, table_name in specified_tables:
 # Create a DataFrame from record counts and display
 record_counts_df = spark.createDataFrame(record_counts)
 display(record_counts_df)
+
+# COMMAND ----------
+
+# Filter record_counts_df by assistant_events table
+filtered_df = record_counts_df.filter(record_counts_df.table_name == "assistant_events")
+
+# Sum all the remaining counts except the ones that have cog_system in catalog
+remaining_sum = filtered_df.filter(~filtered_df.catalog.contains("cog_system")).agg({"count": "sum"}).collect()[0][0]
+
+# Get the count for cog_system
+cog_system_count = filtered_df.filter(filtered_df.catalog.contains("cog_system")).agg({"count": "sum"}).collect()[0][0]
+
+# Ensure the sum equals the count for cog_system
+assert remaining_sum == cog_system_count, "The sum of remaining counts does not equal the count for cog_system"
+
+remaining_sum, cog_system_count
 
 # COMMAND ----------
 

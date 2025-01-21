@@ -80,6 +80,7 @@ else:
 
 # COMMAND ----------
 
+# AZURE API
 from pyspark.sql.types import StructType, StructField, StringType, LongType, MapType, TimestampType
 from pyspark.sql.functions import col, from_unixtime
 
@@ -180,6 +181,16 @@ data_inventory_overview = data_inventory_overview.withColumn(
     )
 )
 display(data_inventory_overview)
+
+# COMMAND ----------
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+data_inventory_overview.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.workspace_details")
+
+print("Metadata successfully stored in `metadata.workspace_details`.")
 
 # COMMAND ----------
 
@@ -425,69 +436,201 @@ display(metadata_df)
 
 # COMMAND ----------
 
+filtered_asset_details_df = metadata_df.filter(
+    (col("schema_name") != "information_schema") & 
+    (~col("catalog_name").startswith("__databricks_internal"))
+).select("catalog_name", "schema_name", "table_name").dropDuplicates()
+display(filtered_asset_details_df)
+
+# COMMAND ----------
+
+filtered_asset_details_df = metadata_df.filter(
+    (col("schema_name") != "information_schema") & 
+    (~col("catalog_name").startswith("__databricks_internal"))
+).select("catalog_name").dropDuplicates()
+display(filtered_asset_details_df)
+
+# COMMAND ----------
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyspark.sql.functions import col
 from pyspark.sql.utils import AnalysisException
 
-# Exclude `information_schema` from processing
-asset_details_df = metadata_df
-filtered_asset_details_df = asset_details_df.filter(
+# **Filter out `information_schema` and system views**
+filtered_asset_details_df = metadata_df.filter(
     (col("schema_name") != "information_schema") & 
-    (~col("catalog_name").startswith("__databricks_internal")))
+    (~col("catalog_name").startswith("__databricks_internal"))
+).select("catalog_name", "schema_name", "table_name").dropDuplicates()
 
-# Function to process a single table and fetch its size details + row count
-def get_table_metadata(row):
-    catalog_name = row["catalog_name"]
-    schema_name = row["schema_name"]
-    table_name = row["table_name"]
+# **Extract unique table list**
+table_list = [
+    (row["catalog_name"], row["schema_name"], row["table_name"])
+    for row in filtered_asset_details_df.select("catalog_name", "schema_name", "table_name").distinct().collect()
+]
+
+print(f"📊 Unique tables to process: {len(table_list)}")
+
+# **Track failed tables to avoid duplicate errors**
+failed_tables = set()
+
+# **Function to process a single table**
+def get_table_metadata(catalog_name, schema_name, table_name):
     full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
     
+    if full_table_name in failed_tables:
+        return None  # Skip already failed tables
+
     try:
-        # Run DESCRIBE DETAIL to get metadata
+        # **Verify table accessibility**
+        check_table_query = f"SHOW TABLES IN {catalog_name}.{schema_name} LIKE '{table_name}'"
+        if spark.sql(check_table_query).count() == 0:
+            print(f"⚠️ {full_table_name} exists but is not accessible. Skipping...")
+            failed_tables.add(full_table_name)
+            return None
+
+        # **Run DESCRIBE DETAIL**
         detail_df = spark.sql(f"DESCRIBE DETAIL {full_table_name}")
-        detail_row = detail_df.collect()[0]  # Fetch the first (and only) row
+        detail_row = detail_df.collect()[0]
 
-        # Extract size in bytes (handle NoneType)
-        size_in_bytes = detail_row["sizeInBytes"]
-        if size_in_bytes is None:
-            size_in_bytes = 0  # Set to 0 if None
+        # **Extract size in bytes (handle None)**
+        size_in_bytes = detail_row["sizeInBytes"] if detail_row["sizeInBytes"] else 0
+        size_in_gb = round(size_in_bytes / (1024 ** 3), 3)
+        size_in_mb = round(size_in_bytes / (1024 ** 2), 3)
 
-        # Convert to GB and MB safely
-        size_in_gb = round(size_in_bytes / (1024 ** 3), 3)  # Convert to GB
-        size_in_mb = round(size_in_bytes / (1024 ** 2), 3)  # Convert to MB
-
-        # Get row count
-        row_count = spark.sql(f"SELECT COUNT(*) AS count FROM {full_table_name}").collect()[0]["count"]
+        # **Get row count**
+        row_count_query = f"SELECT COUNT(*) AS count FROM {full_table_name}"
+        row_count = spark.sql(row_count_query).collect()[0]["count"]
 
         return (catalog_name, schema_name, table_name, size_in_bytes, size_in_gb, size_in_mb, row_count)
 
     except AnalysisException:
         print(f"❌ Table {full_table_name} not found. Skipping...")
+        failed_tables.add(full_table_name)
     except Exception as e:
         print(f"⚠️ Error processing {full_table_name}: {str(e)}")
     
-    return None  # Return None for skipped/error cases
+    return None  # Return None for failed cases
 
-# Initialize ThreadPoolExecutor
-table_metadata_list = []
-with ThreadPoolExecutor(max_workers=8) as executor:  # Adjust workers based on cluster capacity
-    future_to_table = {executor.submit(get_table_metadata, row): row for row in filtered_asset_details_df.collect()}
-    
+# **Parallel Processing with ThreadPoolExecutor**
+size_metadata_list = []
+MAX_WORKERS = 8  # Adjust based on cluster capacity
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    future_to_table = {executor.submit(get_table_metadata, cat, sch, tbl): (cat, sch, tbl) for cat, sch, tbl in table_list}
+
     for future in as_completed(future_to_table):
         result = future.result()
         if result:
-            table_metadata_list.append(result)
+            size_metadata_list.append(result)
 
-# Convert list to DataFrame
-columns = ["catalog_name", "schema_name", "table_name", "size_in_bytes", "size_in_gb", "size_in_mb", "row_count"]
-metadata_df = spark.createDataFrame(table_metadata_list, columns)
+# **Check if we have data before creating DataFrame**
+if size_metadata_list:
+    size_columns = ["catalog_name", "schema_name", "table_name", "size_in_bytes", "size_in_gb", "size_in_mb", "row_count"]
+    size_metadata_df = spark.createDataFrame(size_metadata_list, size_columns)
 
-# Join with original asset details
-final_asset_details_df = filtered_asset_details_df.join(metadata_df, ["catalog_name", "schema_name", "table_name"], "left")
+    # **Join with metadata_df**
+    table_size_rowcount_df = filtered_asset_details_df.join(size_metadata_df, ["catalog_name", "schema_name", "table_name"], "left")
 
-# Display final DataFrame
-display(final_asset_details_df)
+    # **Display the final DataFrame**
+    display(table_size_rowcount_df)
+else:
+    print("⚠️ No valid table metadata found. Possible causes: permissions, missing tables, or failed queries.")
+
+
+# COMMAND ----------
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.functions import col, collect_list, map_entries
+from pyspark.sql.utils import AnalysisException
+
+# **Filter out `information_schema` and system views**
+filtered_asset_details_df = metadata_df.filter(
+    (col("schema_name") != "information_schema") & 
+    (~col("catalog_name").startswith("__databricks_internal"))
+).select("catalog_name", "schema_name", "table_name").dropDuplicates()
+
+# **Extract unique table list**
+table_list = [
+    (row["catalog_name"], row["schema_name"], row["table_name"])
+    for row in filtered_asset_details_df.collect()
+]
+
+print(f"📊 Unique tables to process: {len(table_list)}")
+
+# **Track failed tables to avoid duplicate errors**
+failed_tables = set()
+
+# **Function to fetch `SHOW TBLPROPERTIES` for a table**
+def get_table_properties(catalog_name, schema_name, table_name):
+    full_table_name = f"{catalog_name}.{schema_name}.{table_name}"
+
+    if full_table_name in failed_tables:
+        return None  # Skip already failed tables
+
+    try:
+        # **Verify table accessibility**
+        check_table_query = f"SHOW TABLES IN {catalog_name}.{schema_name} LIKE '{table_name}'"
+        if spark.sql(check_table_query).count() == 0:
+            print(f"⚠️ {full_table_name} exists but is not accessible. Skipping...")
+            failed_tables.add(full_table_name)
+            return None
+
+        # **Fetch Table Properties**
+        properties_df = spark.sql(f"SHOW TBLPROPERTIES {full_table_name}")
+
+        # **Convert properties into a dictionary**
+        properties_dict = {row["key"]: row["value"] for row in properties_df.collect()}
+
+        return (catalog_name, schema_name, table_name, properties_dict)
+
+    except AnalysisException:
+        print(f"❌ Table {full_table_name} not found. Skipping...")
+        failed_tables.add(full_table_name)
+    except Exception as e:
+        print(f"⚠️ Error processing {full_table_name}: {str(e)}")
+
+    return None  # Return None for failed cases
+
+# **Parallel Processing with ThreadPoolExecutor**
+tbl_properties_list = []
+MAX_WORKERS = 8  # Adjust based on cluster capacity
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    future_to_table = {executor.submit(get_table_properties, cat, sch, tbl): (cat, sch, tbl) for cat, sch, tbl in table_list}
+
+    for future in as_completed(future_to_table):
+        result = future.result()
+        if result:
+            tbl_properties_list.append(result)
+
+# **Check if we have data before creating DataFrame**
+if tbl_properties_list:
+    # Convert to DataFrame
+    properties_columns = ["catalog_name", "schema_name", "table_name", "tbl_properties"]
+    tbl_properties_df = spark.createDataFrame(tbl_properties_list, properties_columns)
+
+    # Convert MAP to ARRAY<STRUCT<key: STRING, value: STRING>>
+    tbl_properties_df = tbl_properties_df.withColumn("properties", map_entries(col("tbl_properties")))
+
+    # Flatten the `tbl_properties` column (convert to key-value columns)
+    exploded_tbl_properties_df = (
+        tbl_properties_df
+        .select("catalog_name", "schema_name", "table_name", col("properties"))
+        .selectExpr("catalog_name", "schema_name", "table_name", "inline(properties)")  # Expands key-value pairs
+        .groupby("catalog_name", "schema_name", "table_name")
+        .agg(collect_list("key").alias("property_keys"), collect_list("value").alias("property_values"))
+    )
+
+    # **Join with `final_metadata_df`**
+    enriched_metadata_df = final_metadata_df.join(
+        exploded_tbl_properties_df, ["catalog_name", "schema_name", "table_name"], "left"
+    )
+
+    # **Display the final DataFrame**
+    display(enriched_metadata_df)
+
+else:
+    print("⚠️ No valid table properties found. Possible causes: permissions, missing tables, or failed queries.")
 
 # COMMAND ----------
 
@@ -495,18 +638,9 @@ spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 
 # Save DataFrame as a Table for Future Use
-final_asset_details_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.asset_details")
+final_metadata_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.asset_details")
 
 print("Metadata successfully stored in `metadata.asset_details`.")
-
-# COMMAND ----------
-
-#
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # Breakdown of user types (e.g., System Admin, Analyst, Privacy) - Get token for account level auth testing
 
 # COMMAND ----------
 
