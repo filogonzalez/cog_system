@@ -6,7 +6,8 @@
 
 import requests
 from pyspark.sql.types import (MapType, StringType, IntegerType, LongType, TimestampType, 
-                               DateType, DecimalType, BinaryType, StructType, StructField)
+                               DateType, DecimalType, BinaryType, StructType, StructField, 
+                               BooleanType, ArrayType)
 from pyspark.sql.functions import (collect_set, concat, lit, when, col, explode, broadcast, 
                                    collect_list, map_entries, udf, map_keys, from_unixtime)
 from pyspark.sql.utils import AnalysisException
@@ -167,6 +168,16 @@ else:
 
 # COMMAND ----------
 
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+aliased_workspaces_data.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.workspaces_status")
+
+print("Metadata successfully stored in `metadata.workspaces_status`.")
+
+# COMMAND ----------
+
 # Data Inventory Overview
     # List of Databricks accounts mapped to the applications
     # Cloud provider (AWS/Azure)
@@ -202,9 +213,9 @@ spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 
 # Save DataFrame as a Table for Future Use
-data_inventory_overview.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.workspace_details")
+data_inventory_overview.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.running_workspace_details")
 
-print("Metadata successfully stored in `metadata.workspace_details`.")
+print("Metadata successfully stored in `metadata.running_workspace_details`.")
 
 # COMMAND ----------
 
@@ -270,6 +281,16 @@ if response.status_code == 200:
 else:
     print(f"Error fetching users: {response.status_code} - {response.text}")
 
+
+# COMMAND ----------
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+users_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.users_df")
+
+print("Metadata successfully stored in `metadata.users_df`.")
 
 # COMMAND ----------
 
@@ -455,6 +476,16 @@ display(metadata_df)
 
 # COMMAND ----------
 
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+metadata_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.assets_metadata")
+
+print("Metadata successfully stored in `metadata.assets_metadata`.")
+
+# COMMAND ----------
+
 # **Filter out `information_schema` and system views**
 filtered_asset_details_df = metadata_df.filter(
     (col("schema_name") != "information_schema") & 
@@ -617,12 +648,12 @@ if tbl_properties_list:
     )
 
     # **Join with `final_metadata_df`**
-    enriched_metadata_df = final_metadata_df.join(
+    metadata_tblproperties_df = table_size_rowcount_df.join(
         exploded_tbl_properties_df, ["catalog_name", "schema_name", "table_name"], "left"
     )
 
     # **Display the final DataFrame**
-    display(enriched_metadata_df)
+    display(metadata_tblproperties_df)
 
 else:
     print("⚠️ No valid table properties found. Possible causes: permissions, missing tables, or failed queries.")
@@ -633,240 +664,9 @@ spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 
 # Save DataFrame as a Table for Future Use
-final_metadata_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.asset_details")
+metadata_tblproperties_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.metadata_tblproperties")
 
-print("Metadata successfully stored in `metadata.asset_details`.")
-
-# COMMAND ----------
-
-# Define the access token (ensure this is securely managed)
-ACCESS_TOKEN = f"{ACCESS_TOKEN}"
-
-# Read the clusters table into a DataFrame
-clusters_df = spark.table(f"{SOURCE_CATALOG}.compute.clusters")
-
-# Select distinct cluster_id and workspace_id values
-distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
-
-# Assume data_inventory_overview is already available as a DataFrame
-# Join distinct cluster IDs with data_inventory_overview to get workspace details
-joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
-
-# Define a function to call the Databricks REST API
-def get_cluster_info(workspace_url, cluster_id):
-    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    try:
-        response = requests.get(endpoint, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Status code {response.status_code}: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-# Register the function as a UDF
-get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
-
-# Add a column with cluster information from the API
-result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
-
-# Extract keys from the cluster_info map
-keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
-keys_list = [row[0] for row in keys_df.collect()]
-
-# Create columns for each key in cluster_info
-for key in keys_list:
-    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
-
-# Select relevant columns
-filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
-
-# Remove rows where cluster_id is null
-cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
-
-# Display the resulting DataFrame
-display(cluster_info_id_df)
-
-
-# COMMAND ----------
-
-import requests
-from pyspark.sql.functions import col, lit, udf, explode, map_keys
-from pyspark.sql.types import MapType, StringType
-
-# Read the clusters table into a DataFrame
-clusters_df = spark.table(f"{SOURCE_CATALOG}.compute.clusters")
-
-# Select distinct cluster_id and workspace_id values
-distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
-
-# Assume data_inventory_overview is already available as a DataFrame
-# Join distinct cluster IDs with data_inventory_overview to get workspace details
-joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
-
-# Define a function to call the Databricks REST API to get cluster info
-def get_cluster_info(workspace_url, cluster_id):
-    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    try:
-        response = requests.get(endpoint, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Status code {response.status_code}: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-# Register the function as a UDF
-get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
-
-# Add a column with cluster information from the API
-result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
-
-# Extract keys from the cluster_info map
-keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
-keys_list = [row[0] for row in keys_df.collect()]
-
-# Add the policy_id column with a default value if it's missing
-if 'policy_id' not in keys_list:
-    result_df = result_df.withColumn('policy_id', lit(None))
-
-# Create columns for each key in cluster_info
-for key in keys_list:
-    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
-
-# Select relevant columns
-filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
-
-# Remove rows where cluster_id is null
-cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
-
-# Define a function to call the Databricks REST API to get policy info
-def get_policy_info(workspace_url, policy_id, access_token):
-    if not policy_id:
-        return {"policy_id": None, "name": None, "definition": None, "description": None}
-    endpoint = f"{workspace_url}/api/2.0/policies/clusters/get?policy_id={policy_id}"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    try:
-        response = requests.get(endpoint, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Status code {response.status_code}: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# Register the function as a UDF
-get_policy_info_udf = udf(get_policy_info, MapType(StringType(), StringType()))
-
-# Add a column with policy information from the API
-final_df = cluster_info_id_df.withColumn("policy_info", get_policy_info_udf(col("deployment_url"), col("policy_id")))
-
-# Extract policy_name from the policy_info map
-final_df = final_df.withColumn("policy_name", col("policy_info").getItem("policy_name"))
-
-# Select relevant columns
-final_df = final_df #.select("workspace_id", "deployment_url", "cluster_id", "cluster_name", "policy_id", "policy_name")
-
-# Display the resulting DataFrame
-display(final_df)
-
-
-# COMMAND ----------
-
-import requests
-from pyspark.sql.functions import col, lit, udf, explode, map_keys
-from pyspark.sql.types import MapType, StringType
-
-# Define the access token (ensure this is securely managed)
-ACCESS_TOKEN = f"{ACCESS_TOKEN}"
-
-# Read the clusters table into a DataFrame
-clusters_df = spark.table("cog_land_system.compute.clusters")
-
-# Select distinct cluster_id and workspace_id values
-distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
-
-# Assume data_inventory_overview is already available as a DataFrame
-# Join distinct cluster IDs with data_inventory_overview to get workspace details
-joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
-
-# Define a function to call the Databricks REST API to get cluster info
-def get_cluster_info(workspace_url, cluster_id):
-    endpoint = f"{workspace_url}/api/2.1/clusters/get?cluster_id={cluster_id}"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    try:
-        response = requests.get(endpoint, headers=headers)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"Status code {response.status_code}: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-# Register the function as a UDF
-get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
-
-# Add a column with cluster information from the API
-result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
-
-# Extract keys from the cluster_info map
-keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
-keys_list = [row[0] for row in keys_df.collect()]
-
-# Add the policy_id column with a default value if it's missing
-if 'policy_id' not in keys_list:
-    result_df = result_df.withColumn('policy_id', lit(None))
-
-# Create columns for each key in cluster_info
-for key in keys_list:
-    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
-
-# Select relevant columns
-filtered_df = result_df.select("workspace_id", "deployment_url", "cluster_id", *keys_list)
-
-# Remove rows where cluster_id is null
-cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
-
-# Define a function to call the Databricks REST API to get policy info
-def get_policy_info(workspace_url, policy_id):
-    if policy_id is None:
-        return {"policy_name": None, "policy_definition": None, "policy_description": None}
-    endpoint = f"{workspace_url}/api/2.0/policies/clusters/get?policy_id={policy_id}"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    try:
-        response = requests.get(endpoint, headers=headers)
-        if response.status_code == 200:
-            policy_info = response.json()
-            return {
-                "policy_name": policy_info.get("name", None),
-                "policy_definition": policy_info.get("definition", None),
-                "policy_description": policy_info.get("description", None)
-            }
-        else:
-            return {"policy_name": None, "policy_definition": None, "policy_description": None}
-    except Exception as e:
-        return {"policy_name": None, "policy_definition": None, "policy_description": None}
-
-# Register the function as a UDF
-get_policy_info_udf = udf(get_policy_info, MapType(StringType(), StringType()))
-
-# Add a column with policy information from the API
-final_df = cluster_info_id_df.withColumn("policy_info", get_policy_info_udf(col("deployment_url"), col("policy_id")))
-
-# Extract policy_name, policy_definition, and policy_description from the policy_info map
-final_df = final_df.withColumn("policy_name", col("policy_info").getItem("policy_name"))
-final_df = final_df.withColumn("policy_definition", col("policy_info").getItem("policy_definition"))
-final_df = final_df.withColumn("policy_description", col("policy_info").getItem("policy_description"))
-
-# Select relevant columns
-# final_df = final_df.select("workspace_id", "deployment_url", "cluster_id", "cluster_name", "policy_id", "policy_name", "policy_definition", "policy_description")
-
-# Display the resulting DataFrame
-display(final_df)
-
+print("Metadata successfully stored in `metadata.metadata_tblproperties`.")
 
 # COMMAND ----------
 
@@ -998,24 +798,384 @@ for field in policy_fields:
     final_df = final_df.withColumn(field, col("policy_info").getItem(field))
 
 # Select relevant columns
-final_df = final_df#.select(
-#     "workspace_id",
-#     "deployment_url",
-#     "cluster_id",
-#     "cluster_name",
-#     "policy_id",
-#     "policy_name",
-#     "policy_definition",
-#     "policy_description",
-#     "max_clusters_per_user",
-#     "libraries",
-#     "creator_user_name",
-#     "created_at_timestamp",
-#     "is_default"
-# )
+cluster_policy_info_df = final_df.select(
+"workspace_id",
+"deployment_url",
+"cluster_id",
+"runtime_engine",
+"driver_node_type_id",
+"cluster_source",
+"last_state_loss_time",
+"creator_user_name",
+"node_type_id",
+"state_message",
+"cluster_cores",
+"instance_source",
+"last_activity_time",
+"single_user_name",
+"cluster_name",
+"cluster_memory_mb",
+"spark_version",
+"spark_conf",
+"default_tags",
+"cluster_log_conf",
+"start_time",
+"jdbc_port",
+"spark_env_vars",
+"enable_local_disk_encryption",
+"init_scripts_safe_mode",
+"assigned_principal",
+"enable_elastic_disk",
+"disk_spec",
+"init_scripts",
+"azure_attributes",
+"error",
+"driver_instance_source",
+"driver",
+"num_workers",
+"autoscale",
+"autotermination_minutes",
+"effective_spark_version",
+"policy_id",
+"executors",
+"state",
+"driver_healthy",
+"data_security_mode",
+"terminated_time",
+"spec",
+"spark_context_id",
+"cluster_log_status",
+"custom_tags",
+"termination_reason",
+"last_restarted_time",
+"policy_info",
+"policy_name",
+"policy_definition",
+"policy_description",
+"max_clusters_per_user",
+"libraries",
+"created_at_timestamp",
+"is_default"
+ )
 
 # Display the resulting DataFrame
+display(cluster_policy_info_df)
+
+
+# COMMAND ----------
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+cluster_policy_info_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.cluster_policy")
+
+print("Metadata successfully stored in `metadata.cluster_policy`.")
+
+# COMMAND ----------
+
+from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType
+import time
+
+# Define the schema
+schema = StructType([
+    StructField("name", StringType(), True),
+    StructField("catalog_name", StringType(), True),
+    StructField("schema_name", StringType(), True),
+    StructField("full_name", StringType(), True),
+    StructField("owner", StringType(), True),
+    StructField("id", StringType(), True),
+    StructField("metastore_id", StringType(), True),
+    StructField("created_at", LongType(), True),
+    StructField("created_by", StringType(), True),
+    StructField("updated_at", LongType(), True),
+    StructField("updated_by", StringType(), True),
+    StructField("storage_location", StringType(), True),
+    StructField("securable_type", StringType(), True),
+    StructField("securable_kind", StringType(), True),
+    StructField("comment", StringType(), True),
+    StructField("browse_only", BooleanType(), True)
+])
+
+# Function to fetch models with pagination
+def fetch_all_models(api_url, headers, max_results=50):
+    models_list = []
+    next_page_token = None
+
+    while True:
+        params = {'max_results': max_results}
+        if next_page_token:
+            params['page_token'] = next_page_token
+
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            models_list.extend(data.get('registered_models', []))
+            next_page_token = data.get('next_page_token')
+            if not next_page_token:
+                break
+            # Introduce a delay to respect rate limits
+            time.sleep(0.15)  # Adjust the sleep time as needed
+        else:
+            raise Exception(f"Error fetching models: {response.status_code} - {response.text}")
+
+    return models_list
+
+# TODO : Update the API endpoint and headers with extracted deployment_url
+# API endpoint and headers
+api_url = "https://adb-3288368185694203.3.azuredatabricks.net/api/2.1/unity-catalog/models"
+headers = {
+    "Authorization": f"Bearer {ACCESS_TOKEN}"
+}
+
+# Fetch all models
+try:
+    models_data = fetch_all_models(api_url, headers)
+except Exception as e:
+    print(f"Error fetching models: {e}")
+
+# Create DataFrame
+df = spark.createDataFrame(models_data, schema)
+
+# Show DataFrame
+display(df)
+
+
+# COMMAND ----------
+
+import requests
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, explode_outer, collect_list
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, BooleanType, TimestampType, ArrayType
+
+# **Define the schema for dependencies**
+dependency_schema = StructType([
+    StructField("table_full_name", StringType(), True),
+    StructField("function_full_name", StringType(), True)
+])
+
+# **Define the schema for model_version_dependencies**
+model_version_dependencies_schema = StructType([
+    StructField("dependencies", ArrayType(dependency_schema), True)
+])
+
+# **Define the schema for aliases**
+alias_schema = StructType([
+    StructField("alias_name", StringType(), True),
+    StructField("version_num", IntegerType(), True)
+])
+
+# **Define the main schema**
+schema = StructType([
+    StructField("model_name", StringType(), True),
+    StructField("catalog_name", StringType(), True),
+    StructField("schema_name", StringType(), True),
+    StructField("source", StringType(), True),
+    StructField("status", StringType(), True),
+    StructField("version", IntegerType(), True),
+    StructField("storage_location", StringType(), True),
+    StructField("comment", StringType(), True),
+    StructField("run_id", StringType(), True),
+    StructField("run_workspace_id", StringType(), True),
+    StructField("metastore_id", StringType(), True),
+    StructField("created_at", LongType(), True),
+    StructField("created_by", StringType(), True),
+    StructField("updated_at", LongType(), True),
+    StructField("updated_by", StringType(), True),
+    StructField("id", StringType(), True),
+    StructField("browse_only", BooleanType(), True),
+    StructField("model_version_dependencies", model_version_dependencies_schema, True),
+    StructField("aliases", ArrayType(alias_schema), True)
+])
+
+# **Function to fetch model versions**
+def fetch_model_versions(full_model_name):
+    api_url = f"https://{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions"
+    next_page_token = None
+    model_versions_list = []
+
+    while True:
+        params = {'max_results': 100, 'include_browse': 'true'}  
+        if next_page_token:
+            params['page_token'] = next_page_token
+
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            model_versions_list.extend(data.get('model_versions', []))
+            next_page_token = data.get('next_page_token')
+
+            if not next_page_token:
+                break
+            time.sleep(0.15)  # Respect API rate limits
+        elif response.status_code == 429:
+            print(f"Rate limit hit. Retrying after 5 seconds...")
+            time.sleep(5)
+        else:
+            print(f"❌ Error fetching model versions for {full_model_name}: {response.status_code} - {response.text}")
+            break
+
+    return model_versions_list
+
+# **Function to process a single model (parallel execution)**
+def process_model(full_model_name):
+    return fetch_model_versions(full_model_name)
+
+# **Parallel Processing**
+databricks_instance = "adb-3288368185694203.3.azuredatabricks.net"
+access_token = f"{ACCESS_TOKEN}"
+
+# **List of models to process**
+model_names = [
+    "main.default.bike_share", 
+    "mlops_dev.hotel_cancellation.basic_model",
+    "mlops_dev.hotel_cancellation.hotel_booking_model_fe"
+]  
+
+headers = {
+    "Authorization": f"Bearer {access_token}"
+}
+
+# **Fetch model versions in parallel**
+model_versions_data = []
+with ThreadPoolExecutor(max_workers=5) as executor:
+    future_to_model = {executor.submit(process_model, model): model for model in model_names}
+
+    for future in as_completed(future_to_model):
+        result = future.result()
+        if result:
+            model_versions_data.extend(result)
+
+# **Check API Response Before Processing**
+if not model_versions_data:
+    print("⚠️ No model versions found. Check API response and permissions.")
+else:
+    print(f"✅ Retrieved {len(model_versions_data)} model versions.")
+
+# **Convert API Data to DataFrame**
+df = spark.createDataFrame(model_versions_data, schema)
+
+# **Extract & Flatten Dependencies**
+dependencies_df = (
+    df.withColumn("dependencies", col("model_version_dependencies.dependencies"))
+    .select("catalog_name", "schema_name", "model_name", "version", explode_outer("dependencies"))
+    .select("catalog_name", "schema_name", "model_name", "version", "col.table_full_name", "col.function_full_name")
+    .groupBy("catalog_name", "schema_name", "model_name", "version")
+    .agg(
+        collect_list("table_full_name").alias("dependent_tables"),
+        collect_list("function_full_name").alias("dependent_functions")
+    )
+)
+
+# **Extract & Flatten Aliases**
+aliases_df = (
+    df.withColumn("alias_exp", col("aliases"))
+    .select("catalog_name", "schema_name", "model_name", "version", explode_outer("alias_exp"))
+    .select("catalog_name", "schema_name", "model_name", "version", "col.alias_name", "col.version_num")
+    .groupBy("catalog_name", "schema_name", "model_name", "version")
+    .agg(
+        collect_list("alias_name").alias("alias_names"),
+        collect_list("version_num").alias("alias_versions")
+    )
+)
+
+# **Join Dependencies & Aliases Back to Main Data**
+final_df = (
+    df.join(dependencies_df, ["catalog_name", "schema_name", "model_name", "version"], "left")
+    .join(aliases_df, ["catalog_name", "schema_name", "model_name", "version"], "left")
+)
+
+# **Display Final DataFrame**
 display(final_df)
+
+
+# COMMAND ----------
+
+import requests
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql import SparkSession
+
+# **Initialize Spark Session**
+spark = SparkSession.builder.appName("DebugModelVersions").getOrCreate()
+
+# **Function to Fetch Model Versions**
+def fetch_model_versions(full_model_name):
+    api_url = f"https://{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions"
+    next_page_token = None
+    model_versions_list = []
+
+    while True:
+        params = {'max_results': 100, 'include_browse': 'true'}  # ✅ Ensure full metadata
+        if next_page_token:
+            params['page_token'] = next_page_token
+
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            model_versions_list.extend(data.get('model_versions', []))
+            next_page_token = data.get('next_page_token')
+
+            if not next_page_token:
+                break
+            time.sleep(0.15)  # ✅ Respect API rate limits
+        elif response.status_code == 429:
+            print(f"Rate limit hit. Retrying after 5 seconds...")
+            time.sleep(5)
+        else:
+            print(f"❌ Error fetching model versions for {full_model_name}: {response.status_code} - {response.text}")
+            break
+
+    return model_versions_list
+
+# **Function to Process Models in Parallel**
+def process_model(full_model_name):
+    return fetch_model_versions(full_model_name)
+
+# **Set Up API Connection**
+databricks_instance = "adb-3288368185694203.3.azuredatabricks.net"
+access_token = f"{ACCESS_TOKEN}"  
+
+# **List of Models to Process**
+model_names = [
+    "main.default.bike_share", 
+    "mlops_dev.hotel_cancellation.basic_model",
+    "mlops_dev.hotel_cancellation.hotel_booking_model_fe"
+]  
+
+headers = {
+    "Authorization": f"Bearer {access_token}"
+}
+
+# **Fetch Model Versions in Parallel**
+model_versions_data = []
+with ThreadPoolExecutor(max_workers=5) as executor:
+    future_to_model = {executor.submit(process_model, model): model for model in model_names}
+
+    for future in as_completed(future_to_model):
+        result = future.result()
+        if result:
+            model_versions_data.extend(result)
+
+# **Print API Response Before Processing**
+if not model_versions_data:
+    print("⚠️ No model versions found. Check API response and permissions.")
+else:
+    print("✅ Sample API Response (First Model Version):")
+    print(model_versions_data[0])  # ✅ Print first result to debug structure
+
+# **Load Data into Spark DataFrame (Without Schema)**
+df = spark.createDataFrame(model_versions_data)  # ✅ No schema, infer everything dynamically
+
+# **Display Everything for Debugging**
+print("🔍 DataFrame Schema:")
+df.printSchema()  # ✅ Show all fields detected
+display(df)  # ✅ View full data to find missing fields
 
 
 # COMMAND ----------
