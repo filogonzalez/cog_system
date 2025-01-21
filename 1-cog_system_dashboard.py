@@ -444,14 +444,6 @@ display(filtered_asset_details_df)
 
 # COMMAND ----------
 
-filtered_asset_details_df = metadata_df.filter(
-    (col("schema_name") != "information_schema") & 
-    (~col("catalog_name").startswith("__databricks_internal"))
-).select("catalog_name").dropDuplicates()
-display(filtered_asset_details_df)
-
-# COMMAND ----------
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyspark.sql.functions import col
 from pyspark.sql.utils import AnalysisException
@@ -641,6 +633,67 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 final_metadata_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.asset_details")
 
 print("Metadata successfully stored in `metadata.asset_details`.")
+
+# COMMAND ----------
+
+import requests
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col, map_keys, explode
+from pyspark.sql.types import MapType, StringType
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("ClusterInfoRetrieval").getOrCreate()
+
+# Define the access token (ensure this is securely managed)
+ACCESS_TOKEN = f"{ACCESS_TOKEN}"
+
+# Read the clusters table into a DataFrame
+clusters_df = spark.table("cog_land_system.compute.clusters")
+
+# Select distinct cluster_id and workspace_id values
+distinct_cluster_ids = clusters_df.select("cluster_id", "workspace_id").distinct()
+
+# Assume data_inventory_overview is already available as a DataFrame
+# Join distinct cluster IDs with data_inventory_overview to get workspace details
+joined_df = distinct_cluster_ids.join(data_inventory_overview, on="workspace_id", how="inner")
+
+# Define a function to call the Databricks REST API
+def get_cluster_info(workspace_url, cluster_id):
+    endpoint = f"{workspace_url}/api/2.0/clusters/get?cluster_id={cluster_id}"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    try:
+        response = requests.get(endpoint, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {"error": f"Status code {response.status_code}: {response.text}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Register the function as a UDF
+get_cluster_info_udf = udf(get_cluster_info, MapType(StringType(), StringType()))
+
+# Add a column with cluster information from the API
+result_df = joined_df.withColumn("cluster_info", get_cluster_info_udf(col("deployment_url"), col("cluster_id")))
+
+# Extract keys from the cluster_info map
+keys_df = result_df.select(explode(map_keys(col("cluster_info")))).distinct()
+keys_list = [row[0] for row in keys_df.collect()]
+
+# Create columns for each key in cluster_info
+for key in keys_list:
+    result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
+
+# Select relevant columns
+final_df = result_df.select("cluster_id", "workspace_id", "deployment_url", *keys_list)
+
+# Display the resulting DataFrame
+display(final_df)
+
+
+# COMMAND ----------
+
+display(joined_df.select("cluster_id", "workspace_id", "deployment_url").distinct())
 
 # COMMAND ----------
 
