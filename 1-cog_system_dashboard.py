@@ -685,15 +685,18 @@ for key in keys_list:
     result_df = result_df.withColumn(key, col("cluster_info").getItem(key))
 
 # Select relevant columns
-final_df = result_df.select("cluster_id", "workspace_id", "deployment_url", *keys_list)
+filtered_df = result_df.select( "workspace_id", "deployment_url", "cluster_id", *keys_list)
+
+# Remove rows where cluster_id is null
+cluster_info_id_df = filtered_df.filter(col("cluster_id").isNotNull())
 
 # Display the resulting DataFrame
-display(final_df)
+display(cluster_info_id_df)
 
 
 # COMMAND ----------
 
-display(joined_df.select("cluster_id", "workspace_id", "deployment_url").distinct())
+
 
 # COMMAND ----------
 
