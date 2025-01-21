@@ -1,9 +1,19 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC # Import libs
+
+# COMMAND ----------
+
 import requests
 import json
 from pyspark.sql.functions import collect_set, concat, lit, when, col, explode, broadcast
 from pyspark.sql.utils import AnalysisException
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Parameter widgets
 
 # COMMAND ----------
 
@@ -18,6 +28,11 @@ TARGET_CATALOG = dbutils.widgets.get("TARGET_CATALOG")
 INFO_SCHEMA_TARGET = dbutils.widgets.get("INFO_SCHEMA_TARGET")
 EXCLUDED_SCHEMAS = set(dbutils.widgets.get("EXCLUDED_SCHEMAS").split(","))
 EXCLUDED_TABLES = set(dbutils.widgets.get("EXCLUDED_TABLES").split(","))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Inventory Overview
 
 # COMMAND ----------
 
@@ -265,6 +280,11 @@ print(f"Total distinct users: {total_users}")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Catalog Details
+
+# COMMAND ----------
+
 # Assets name, Assets owner, Assets description/comments Data Stewards, Tags (domain/category, confidentiality, sensitive data types, PII/PCI, business glossary association …)
 # Function to safely load system tables with prefixed column names
 def load_system_table(table_name, prefix):
@@ -433,14 +453,6 @@ metadata_df = metadata_df.select(
 
 # Display results
 display(metadata_df)
-
-# COMMAND ----------
-
-filtered_asset_details_df = metadata_df.filter(
-    (col("schema_name") != "information_schema") & 
-    (~col("catalog_name").startswith("__databricks_internal"))
-).select("catalog_name", "schema_name", "table_name").dropDuplicates()
-display(filtered_asset_details_df)
 
 # COMMAND ----------
 
@@ -1056,13 +1068,4 @@ if token_response.status_code == 200:
     print("🔑 New Access Token:", workspace_token)
 else:
     print(f"❌ Error creating workspace access token: {token_response.status_code} - {token_response.text}")
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # Catalog details
-
-# COMMAND ----------
-
 
