@@ -1,4 +1,20 @@
 # Databricks notebook source
+# Inspect the schema to find the correct column name
+providers_df = spark.sql("SHOW PROVIDERS")
+
+# Assuming the correct column name is 'provider'
+providers = [row.name for row in providers_df.collect()]
+
+shares = []
+for provider in providers:
+    shares_df = spark.sql(f"SHOW SHARES IN PROVIDER `{provider}`")
+    shares.extend([row.name for row in shares_df.collect()])
+
+# # Convert the list of shares to a DataFrame
+shares = spark.createDataFrame([(share,) for share in shares], ["share_name"])
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # Import libs
 
@@ -61,7 +77,7 @@ cloud_str = ','.join(clouds_list)
 # Replace these with your actual values
 ACCOUNT_ID = f"{account_id_str}"  # Example: "83988469-aba5-4d3d-bcad-f8707acc74cd"
 CLIENT_ID = "83988469-aba5-4d3d-bcad-f8707acc74cd"
-CLIENT_SECRET = "dose1f2a6b5faf019bee3eb6e0514794d83b"
+CLIENT_SECRET = dbutils.secrets.get(scope = "cog_system", key = "accnt_admin_sp")
 
 # Determine the OAuth Token Endpoint based on the cloud provider
 if cloud_str == "AWS":
@@ -119,7 +135,6 @@ schema = StructType([
     # StructField("storage_configuration_id", StringType(), True),
 ])
 
-# Run in sharing accounts
 # Account region/location (e.g. US-East2)
 # API endpoint to fetch all workspaces
 if cloud_str == "AWS":
@@ -486,6 +501,11 @@ print("Metadata successfully stored in `metadata.assets_metadata`.")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Asset Properties 
+
+# COMMAND ----------
+
 # **Filter out `information_schema` and system views**
 filtered_asset_details_df = metadata_df.filter(
     (col("schema_name") != "information_schema") & 
@@ -667,6 +687,11 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 metadata_tblproperties_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.metadata_tblproperties")
 
 print("Metadata successfully stored in `metadata.metadata_tblproperties`.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Compute Policies
 
 # COMMAND ----------
 
@@ -868,9 +893,14 @@ spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 
 # Save DataFrame as a Table for Future Use
-cluster_policy_info_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.cluster_policy")
+cluster_policy_info_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.cluster_policy_assets")
 
-print("Metadata successfully stored in `metadata.cluster_policy`.")
+print("Metadata successfully stored in `metadata.cluster_policy_assets`.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Models
 
 # COMMAND ----------
 
@@ -936,252 +966,372 @@ except Exception as e:
     print(f"Error fetching models: {e}")
 
 # Create DataFrame
-df = spark.createDataFrame(models_data, schema)
+asset_models = spark.createDataFrame(models_data, schema)
 
 # Show DataFrame
-display(df)
+display(asset_models)
 
 
 # COMMAND ----------
 
-import requests
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, explode_outer, collect_list
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, BooleanType, TimestampType, ArrayType
+distinct_full_names = asset_models.select("full_name").distinct().collect()
+distinct_full_names = [row["full_name"] for row in distinct_full_names]
+distinct_full_names
 
-# **Define the schema for dependencies**
-dependency_schema = StructType([
-    StructField("table_full_name", StringType(), True),
-    StructField("function_full_name", StringType(), True)
-])
+# COMMAND ----------
 
-# **Define the schema for model_version_dependencies**
-model_version_dependencies_schema = StructType([
-    StructField("dependencies", ArrayType(dependency_schema), True)
-])
+# **Databricks API Configuration**
+databricks_instance = "https://adb-3288368185694203.3.azuredatabricks.net"
+access_token = f"{ACCESS_TOKEN}"
 
-# **Define the schema for aliases**
-alias_schema = StructType([
-    StructField("alias_name", StringType(), True),
-    StructField("version_num", IntegerType(), True)
-])
+# **Headers for Authentication**
+headers = {
+    "Authorization": f"Bearer {access_token}"
+}
 
-# **Define the main schema**
-schema = StructType([
+# **Function to Fetch All Registered Models**
+def fetch_all_models():
+    api_url = f"{databricks_instance}/api/2.1/unity-catalog/models"
+    all_models = []
+    next_page_token = None
+
+    while True:
+        params = {"max_results": 50}
+        if next_page_token:
+            params["page_token"] = next_page_token
+
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            all_models.extend(data.get("registered_models", []))
+            next_page_token = data.get("next_page_token")
+            if not next_page_token:
+                break
+        else:
+            print(f"❌ Error fetching models: {response.status_code} - {response.text}")
+            break
+
+    return all_models
+
+# **Function to Fetch Model Versions**
+def fetch_model_versions(full_model_name):
+    api_url = f"{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions"
+    all_versions = []
+    next_page_token = None
+
+    while True:
+        params = {"max_results": 100, "include_aliases": True, "include_browse": True}
+        if next_page_token:
+            params["page_token"] = next_page_token
+
+        response = requests.get(api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            all_versions.extend(data.get("model_versions", []))
+            next_page_token = data.get("next_page_token")
+            if not next_page_token:
+                break
+        else:
+            print(f"❌ Error fetching versions for {full_model_name}: {response.status_code} - {response.text}")
+            break
+
+    return all_versions
+
+# **Function to Fetch Full Details of a Specific Model Version**
+def fetch_model_version_details(full_model_name, version):
+    api_url = f"{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions/{version}"
+    
+    params = {"include_browse": True, "include_aliases": True}
+    response = requests.get(api_url, headers=headers, params=params)
+
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"❌ Error fetching details for {full_model_name} v{version}: {response.status_code} - {response.text}")
+        return None
+
+# **Fetch All Models**
+models_data = fetch_all_models()
+model_full_names = [model["full_name"] for model in models_data]
+
+# **Fetch All Versions & Their Full Details**
+detailed_model_versions = []
+
+for full_model_name in model_full_names:
+    model_versions = fetch_model_versions(full_model_name)
+    
+    for model_version in model_versions:
+        version_number = model_version["version"]
+        full_details = fetch_model_version_details(full_model_name, version_number)
+        
+        if full_details:
+            detailed_model_versions.append(full_details)
+
+# **Define Schema for DataFrame**
+model_version_schema = StructType([
     StructField("model_name", StringType(), True),
     StructField("catalog_name", StringType(), True),
     StructField("schema_name", StringType(), True),
     StructField("source", StringType(), True),
+    StructField("comment", StringType(), True),
+    StructField("run_id", StringType(), True),
+    StructField("run_workspace_id", LongType(), True),
     StructField("status", StringType(), True),
     StructField("version", IntegerType(), True),
     StructField("storage_location", StringType(), True),
-    StructField("comment", StringType(), True),
-    StructField("run_id", StringType(), True),
-    StructField("run_workspace_id", StringType(), True),
     StructField("metastore_id", StringType(), True),
     StructField("created_at", LongType(), True),
     StructField("created_by", StringType(), True),
     StructField("updated_at", LongType(), True),
     StructField("updated_by", StringType(), True),
     StructField("id", StringType(), True),
-    StructField("browse_only", BooleanType(), True),
-    StructField("model_version_dependencies", model_version_dependencies_schema, True),
-    StructField("aliases", ArrayType(alias_schema), True)
+    StructField("dependencies", ArrayType(MapType(StringType(), StringType())), True),  # Store as ARRAY of key-value pairs
+    StructField("aliases", ArrayType(MapType(StringType(), StringType())), True)
 ])
 
-# **Function to fetch model versions**
-def fetch_model_versions(full_model_name):
-    api_url = f"https://{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions"
-    next_page_token = None
-    model_versions_list = []
+# **Format Data for DataFrame**
+formatted_data = []
+for model_version in detailed_model_versions:
+    dependencies = model_version.get("model_version_dependencies", {}).get("dependencies", [])
 
-    while True:
-        params = {'max_results': 100, 'include_browse': 'true'}  
-        if next_page_token:
-            params['page_token'] = next_page_token
+    # **Convert Dependencies to Array of Key-Value Pairs**
+    extracted_dependencies = []
+    for dep in dependencies:
+        if "table" in dep:
+            extracted_dependencies.append({"type": "table", "name": dep["table"]["table_full_name"]})
+        elif "function" in dep:
+            extracted_dependencies.append({"type": "function", "name": dep["function"]["function_full_name"]})
 
-        response = requests.get(api_url, headers=headers, params=params)
+    aliases = model_version.get("aliases", [])
+    extracted_aliases = [{"alias_name": alias["alias_name"], "version_num": alias["version_num"]} for alias in aliases]
 
-        if response.status_code == 200:
-            data = response.json()
-            model_versions_list.extend(data.get('model_versions', []))
-            next_page_token = data.get('next_page_token')
+    formatted_data.append({
+        "model_name": model_version["model_name"],
+        "catalog_name": model_version["catalog_name"],
+        "schema_name": model_version["schema_name"],
+        "source": model_version.get("source", ""),
+        "comment": model_version.get("comment", ""),
+        "run_id": model_version.get("run_id", None),
+        "run_workspace_id": model_version.get("run_workspace_id", None),
+        "status": model_version["status"],
+        "version": model_version["version"],
+        "storage_location": model_version["storage_location"],
+        "metastore_id": model_version["metastore_id"],
+        "created_at": model_version["created_at"],
+        "created_by": model_version["created_by"],
+        "updated_at": model_version["updated_at"],
+        "updated_by": model_version["updated_by"],
+        "id": model_version["id"],
+        "dependencies": extracted_dependencies,  # Store as Array of Maps
+        "aliases": extracted_aliases
+    })
 
-            if not next_page_token:
-                break
-            time.sleep(0.15)  # Respect API rate limits
-        elif response.status_code == 429:
-            print(f"Rate limit hit. Retrying after 5 seconds...")
-            time.sleep(5)
-        else:
-            print(f"❌ Error fetching model versions for {full_model_name}: {response.status_code} - {response.text}")
-            break
+# **Create Spark DataFrame**
+model_versions_df = spark.createDataFrame(formatted_data, model_version_schema)
 
-    return model_versions_list
+# **Display DataFrame**
+display(model_versions_df)
 
-# **Function to process a single model (parallel execution)**
-def process_model(full_model_name):
-    return fetch_model_versions(full_model_name)
 
-# **Parallel Processing**
-databricks_instance = "adb-3288368185694203.3.azuredatabricks.net"
-access_token = f"{ACCESS_TOKEN}"
+# COMMAND ----------
 
-# **List of models to process**
-model_names = [
-    "main.default.bike_share", 
-    "mlops_dev.hotel_cancellation.basic_model",
-    "mlops_dev.hotel_cancellation.hotel_booking_model_fe"
-]  
+# MAGIC %md
+# MAGIC # Volumes
 
-headers = {
-    "Authorization": f"Bearer {access_token}"
-}
+# COMMAND ----------
 
-# **Fetch model versions in parallel**
-model_versions_data = []
-with ThreadPoolExecutor(max_workers=5) as executor:
-    future_to_model = {executor.submit(process_model, model): model for model in model_names}
+# Load the required system tables
+volume_privileges_df = load_system_table("volume_privileges", "volume_privileges")
+volume_tags_df = load_system_table("volume_tags", "volume_tags")
+volumes_df = load_system_table("volumes", "volumes")
 
-    for future in as_completed(future_to_model):
-        result = future.result()
-        if result:
-            model_versions_data.extend(result)
+# Ensure required tables are loaded
+if not all([volume_privileges_df, volume_tags_df, volumes_df]):
+    print("❌ Critical volume tables are missing. Aborting process.")
+    exit()
 
-# **Check API Response Before Processing**
-if not model_versions_data:
-    print("⚠️ No model versions found. Check API response and permissions.")
-else:
-    print(f"✅ Retrieved {len(model_versions_data)} model versions.")
-
-# **Convert API Data to DataFrame**
-df = spark.createDataFrame(model_versions_data, schema)
-
-# **Extract & Flatten Dependencies**
-dependencies_df = (
-    df.withColumn("dependencies", col("model_version_dependencies.dependencies"))
-    .select("catalog_name", "schema_name", "model_name", "version", explode_outer("dependencies"))
-    .select("catalog_name", "schema_name", "model_name", "version", "col.table_full_name", "col.function_full_name")
-    .groupBy("catalog_name", "schema_name", "model_name", "version")
-    .agg(
-        collect_list("table_full_name").alias("dependent_tables"),
-        collect_list("function_full_name").alias("dependent_functions")
-    )
+# Join volume_tags with volumes
+volumes_df = volumes_df.join(
+    broadcast(volume_tags_df), 
+    (volumes_df["volumes_volume_name"] == volume_tags_df["volume_tags_volume_name"]) &
+    (volumes_df["volumes_volume_schema"] == volume_tags_df["volume_tags_schema_name"]) &
+    (volumes_df["volumes_volume_catalog"] == volume_tags_df["volume_tags_catalog_name"]),
+    "left"
 )
 
-# **Extract & Flatten Aliases**
-aliases_df = (
-    df.withColumn("alias_exp", col("aliases"))
-    .select("catalog_name", "schema_name", "model_name", "version", explode_outer("alias_exp"))
-    .select("catalog_name", "schema_name", "model_name", "version", "col.alias_name", "col.version_num")
-    .groupBy("catalog_name", "schema_name", "model_name", "version")
-    .agg(
-        collect_list("alias_name").alias("alias_names"),
-        collect_list("version_num").alias("alias_versions")
-    )
+# Join volume_privileges with volumes
+volumes_df = volumes_df.join(
+    broadcast(volume_privileges_df), 
+    (volumes_df["volumes_volume_name"] == volume_privileges_df["volume_privileges_volume_name"]) &
+    (volumes_df["volumes_volume_schema"] == volume_privileges_df["volume_privileges_volume_schema"]) &
+    (volumes_df["volumes_volume_catalog"] == volume_privileges_df["volume_privileges_volume_catalog"]),
+    "left"
 )
 
-# **Join Dependencies & Aliases Back to Main Data**
-final_df = (
-    df.join(dependencies_df, ["catalog_name", "schema_name", "model_name", "version"], "left")
-    .join(aliases_df, ["catalog_name", "schema_name", "model_name", "version"], "left")
-)
+volumes_df = volumes_df.select("volumes_volume_catalog",
+"volumes_volume_schema",
+"volumes_volume_name",
+"volumes_volume_type",
+"volumes_volume_owner",
+"volumes_comment",
+"volumes_storage_location",
+"volumes_created",
+"volumes_created_by",
+"volumes_last_altered",
+"volumes_last_altered_by",
+"volume_tags_tag_name",
+"volume_tags_tag_value",
+"volume_privileges_grantor",
+"volume_privileges_grantee",
+"volume_privileges_privilege_type",
+"volume_privileges_is_grantable",
+"volume_privileges_inherited_from")
 
-# **Display Final DataFrame**
-display(final_df)
+# Display the joined DataFrame
+display(volumes_df)
 
+# COMMAND ----------
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS {TARGET_CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
+
+# Save DataFrame as a Table for Future Use
+volumes_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.volumes_assets")
+
+print("Metadata successfully stored in `metadata.volumes_assets`.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # dev testing zone do not run
 
 # COMMAND ----------
 
 import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pyspark.sql import SparkSession
 
-# **Initialize Spark Session**
-spark = SparkSession.builder.appName("DebugModelVersions").getOrCreate()
+# **Databricks API Configuration**
+distinct_deployment_urls = data_inventory_overview.select("deployment_url").distinct().rdd.flatMap(lambda x: x).collect()
 
-# **Function to Fetch Model Versions**
-def fetch_model_versions(full_model_name):
-    api_url = f"https://{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions"
-    next_page_token = None
-    model_versions_list = []
+access_token = f"{ACCESS_TOKEN}"  # ✅ Ensure this is set correctly
 
-    while True:
-        params = {'max_results': 100, 'include_browse': 'true'}  # ✅ Ensure full metadata
-        if next_page_token:
-            params['page_token'] = next_page_token
-
-        response = requests.get(api_url, headers=headers, params=params)
-
-        if response.status_code == 200:
-            data = response.json()
-            model_versions_list.extend(data.get('model_versions', []))
-            next_page_token = data.get('next_page_token')
-
-            if not next_page_token:
-                break
-            time.sleep(0.15)  # ✅ Respect API rate limits
-        elif response.status_code == 429:
-            print(f"Rate limit hit. Retrying after 5 seconds...")
-            time.sleep(5)
-        else:
-            print(f"❌ Error fetching model versions for {full_model_name}: {response.status_code} - {response.text}")
-            break
-
-    return model_versions_list
-
-# **Function to Process Models in Parallel**
-def process_model(full_model_name):
-    return fetch_model_versions(full_model_name)
-
-# **Set Up API Connection**
-databricks_instance = "adb-3288368185694203.3.azuredatabricks.net"
-access_token = f"{ACCESS_TOKEN}"  
-
-# **List of Models to Process**
-model_names = [
-    "main.default.bike_share", 
-    "mlops_dev.hotel_cancellation.basic_model",
-    "mlops_dev.hotel_cancellation.hotel_booking_model_fe"
-]  
-
+# **Headers for Authentication**
 headers = {
     "Authorization": f"Bearer {access_token}"
 }
 
-# **Fetch Model Versions in Parallel**
-model_versions_data = []
-with ThreadPoolExecutor(max_workers=5) as executor:
-    future_to_model = {executor.submit(process_model, model): model for model in model_names}
+# **Step 1: Fetch All Available Catalogs**
+def fetch_catalogs(databricks_instance):
+    catalogs_api_url = f"{databricks_instance}/api/2.1/unity-catalog/catalogs"
+    response = requests.get(catalogs_api_url, headers=headers)
+    if response.status_code == 200:
+        return [catalog["name"] for catalog in response.json().get("catalogs", [])]
+    else:
+        print(f"❌ Error fetching catalogs from {databricks_instance}: {response.status_code} - {response.text}")
+        return []
 
-    for future in as_completed(future_to_model):
-        result = future.result()
-        if result:
-            model_versions_data.extend(result)
+# **Step 2: Fetch All Schemas for a Given Catalog**
+def fetch_schemas(databricks_instance, catalog_name):
+    schemas_api_url = f"{databricks_instance}/api/2.1/unity-catalog/schemas"
+    params = {"catalog_name": catalog_name}
+    response = requests.get(schemas_api_url, headers=headers, params=params)
+    if response.status_code == 200:
+        return [schema["name"] for schema in response.json().get("schemas", [])]
+    else:
+        print(f"❌ Error fetching schemas for {catalog_name} from {databricks_instance}: {response.status_code} - {response.text}")
+        return []
 
-# **Print API Response Before Processing**
-if not model_versions_data:
-    print("⚠️ No model versions found. Check API response and permissions.")
+# **Step 3: Fetch Volumes for a Given (Catalog, Schema)**
+def fetch_volumes(databricks_instance, catalog_name, schema_name):
+    volumes_api_url = f"{databricks_instance}/api/2.1/unity-catalog/volumes"
+    volumes_list = []
+    next_page_token = None
+
+    while True:
+        params = {
+            "catalog_name": catalog_name,
+            "schema_name": schema_name,
+            "max_results": 1000  # ✅ Fetch as many as possible
+        }
+        if next_page_token:
+            params["page_token"] = next_page_token
+
+        response = requests.get(volumes_api_url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            volumes_list.extend(data.get("volumes", []))
+            next_page_token = data.get("next_page_token")
+
+            if not next_page_token:
+                break  # ✅ Exit loop when no more pages
+            time.sleep(0.15)  # ✅ Respect API rate limits
+        elif response.status_code == 429:
+            print(f"⚠️ Rate limit hit. Retrying after 5 seconds...")
+            time.sleep(5)
+        else:
+            print(f"❌ Error fetching volumes for {catalog_name}.{schema_name} from {databricks_instance}: {response.status_code} - {response.text}")
+            break
+
+    return volumes_list
+
+volume_results = []
+
+for databricks_instance in distinct_deployment_urls:
+    # **Fetch All Catalogs**
+    catalogs = fetch_catalogs(databricks_instance)
+
+    if not catalogs:
+        print(f"⚠️ No catalogs found in {databricks_instance}.")
+        continue
+
+    print(f"✅ Found {len(catalogs)} catalogs in {databricks_instance}: {catalogs}")
+
+    # **Fetch All Schemas for Each Catalog in Parallel**
+    schema_tasks = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_catalog = {executor.submit(fetch_schemas, databricks_instance, catalog): catalog for catalog in catalogs}
+
+        for future in as_completed(future_to_catalog):
+            catalog_name = future_to_catalog[future]
+            schemas = future.result()
+            if schemas:
+                schema_tasks[catalog_name] = schemas
+
+    print(f"✅ Retrieved schemas for {len(schema_tasks)} catalogs in {databricks_instance}.")
+
+    # **Fetch All Volumes in Parallel**
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_schema = {
+            executor.submit(fetch_volumes, databricks_instance, catalog, schema): (catalog, schema)
+            for catalog, schemas in schema_tasks.items()
+            for schema in schemas
+        }
+
+        for future in as_completed(future_to_schema):
+            catalog_name, schema_name = future_to_schema[future]
+            volumes = future.result()
+            if volumes:
+                volume_results.extend(volumes)
+
+# **Check API Response Before Processing**
+if not volume_results:
+    print("⚠️ No volumes found. Check API response and permissions.")
 else:
-    print("✅ Sample API Response (First Model Version):")
-    print(model_versions_data[0])  # ✅ Print first result to debug structure
+    print(f"✅ Retrieved {len(volume_results)} volumes.")
+    print("🔍 Sample Volume Data:")
+    print(volume_results[0])  # ✅ Print first result to debug
 
-# **Load Data into Spark DataFrame (Without Schema)**
-df = spark.createDataFrame(model_versions_data)  # ✅ No schema, infer everything dynamically
+# **Load Data into Spark DataFrame**
+df = spark.createDataFrame(volume_results)
 
 # **Display Everything for Debugging**
 print("🔍 DataFrame Schema:")
-df.printSchema()  # ✅ Show all fields detected
-display(df)  # ✅ View full data to find missing fields
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # dev testing zone do not run
+df.printSchema()  # ✅ Show all detected fields
+display(df)  # ✅ View all retrieved volumes
 
 # COMMAND ----------
 
@@ -1473,67 +1623,4 @@ if validated_users:
     display(validated_users_df)
 else:
     print("⚠️ No validated users found.")
-
-
-# COMMAND ----------
-
-import requests
-
-# Replace with your actual values
-CLIENT_ID = "83988469-aba5-4d3d-bcad-f8707acc74cd"
-CLIENT_SECRET = "dose1f2a6b5faf019bee3eb6e0514794d83b"
-DATABRICKS_HOST = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().getOrElse(None)
-
-# OAuth Token URL (Workspace Level)
-token_url = f"{DATABRICKS_HOST}/api/2.0/token/create"
-
-# Request Headers
-headers = {
-    "Authorization": f"Basic {CLIENT_ID}:{CLIENT_SECRET}",
-    "Content-Type": "application/json"
-}
-
-# Request Payload (Token Request)
-payload = {
-    "lifetime_seconds": 3600,  # 1 hour token
-    "comment": "Token for Service Principal"
-}
-
-# Make the POST request
-response = requests.post(token_url, json=payload, headers=headers)
-
-# Handle Response
-if response.status_code == 200:
-    token_data = response.json()
-    ACCESS_TOKEN = token_data.get("token_value")
-    print("✅ Successfully retrieved access token!")
-    print("🔑 Access Token:", ACCESS_TOKEN)
-else:
-    print(f"❌ Error obtaining access token: {response.status_code} - {response.text}")
-
-
-# COMMAND ----------
-
-# Step 2: Use OAuth Token to Create a Workspace Access Token
-token_create_url = f"{DATABRICKS_HOST}/api/2.0/token/create"
-
-headers = {
-    "Authorization": f"Bearer {oauth_token}",
-    "Content-Type": "application/json"
-}
-
-payload = {
-    "lifetime_seconds": 3600,  # Token expires in 1 hour
-    "comment": "Workspace token for Service Principal"
-}
-
-# Request a new workspace access token
-token_response = requests.post(token_create_url, json=payload, headers=headers)
-
-if token_response.status_code == 200:
-    workspace_token = token_response.json().get("token_value")
-    print("✅ Successfully created a workspace access token for Service Principal!")
-    print("🔑 New Access Token:", workspace_token)
-else:
-    print(f"❌ Error creating workspace access token: {token_response.status_code} - {token_response.text}")
 
