@@ -7,21 +7,29 @@ System Tables Requirements
 - i.	(remember if we want the information to be considered we need to ensure each catalog/metastore shares the system information with the objective catalog)
 1.	For this picture example, we would need to run the system_account_provider.app in each catalog a total of 5 times because we have 5 catalogs:
 ![](README resources/catalog metastore.png)
+
 2.	If there is and admin group already associated to each workspace, we can add our “admin account Service Principal” to that admin group:
 ![](README resources/admin group permission.png)
+
 3.	If step No. 2 was successfully done jump to step 5
+
 4.	The created admin Service Principal needs to be added to the workspace as well as admin:
 a.	 ![](README resources/wp admin for SP.png)
+
 5.	In the account console at the metastore (catalog) level select the “Allow Delta Sharing with parties outside your organization” checkbox for every account required in this solution.
 a.	Unselect expiration “Delta Sharing token lifetime”
 b.	Give an organization name \
 i. ![](README resources/enable delta sharing.png) \
 ii.	Copy sharing identifier from the workspace in delta sharing UI\
   ![](README resources/sharing id.png)
+
 6.	Create new recipients in sharing accounts
 a.	 ![](README resources/new recipient.png)
-7.	Generate coe_account_name_system_tables because system tables cannot be directly shared.
-a.	Run coe_account_name_system_tables script
+
+7.	We need to generate cog_land_system catalog because databricks system tables cannot be directly shared.
+a.	to achieve this run 1-cog_land_system script (the 0-secret_management script should be run to retrieve the token for the Service Principal with account admin priviliges by creating its scope and storing the key in it).\
+b.  Run 2-cog_system_dashboard script to add all the missing metadata required.
+
 8.	Create share grants
 a.	Add assets
 i.	Grant permissions and select each schema to share.
@@ -30,8 +38,9 @@ ii.	Missing permissions
 a.	 ![](README resources/share schema compute.png)\
 iii.	Add recipients to share these assets to:\
 ![](README resources/add recipients.png)\
-b.	To view and use the data, create a catalog from a share. The data will appear under your account’s shared catalogs.\
+b.	To view and use the data, create a catalog from a share in the <b>core workspace</b>. The data will appear under your account’s shared catalogs.\
  ![](README resources/create catalog from share.png)
-9.	Run the Center of Excellence System Tables source of truth script, which will merge and append new records only into our CoE system tables.
 
+9.	In the core workspace run 0-secret_management script, 1-cog_land_system, 2-cog_system_dashboard and 3-System_Tables_source_of_truth script, which will merge and append new records only into our CoE system tables.
+10. Finish
 
