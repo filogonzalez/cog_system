@@ -522,7 +522,7 @@ from pyspark.sql.functions import col
 EXCLUDED_SCHEMAS = list(EXCLUDED_SCHEMAS)
 EXCLUDED_TABLES = list(EXCLUDED_TABLES)
 
-# **Fix: Extract `share_name` directly from Row objects**
+# **Fix: Extract share_name directly from Row objects**
 EXCLUDED_SHARES = [row.share_name for row in EXCLUDED_SHARES]  # ✅ Extracting the correct field
 
 def apply_exclusions(df, schema_col="schema_name", table_col="table_name", catalog_col="catalog_name"):
