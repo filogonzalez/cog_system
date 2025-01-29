@@ -5,7 +5,7 @@ System Tables Requirements
 1.	Create a Service Principal on each account with account admin role privileges and access to all the catalogs/metastores inside that account.
 ![](README resources/account admin SP.png)
 - i.	(remember if we want the information to be considered we need to ensure each catalog/metastore shares the system information with the objective catalog)
-1.	For this picture example, we would need to run the system_account_provider.app in each catalog a total of 5 times because we have 5 catalogs:
+1.	For this picture example, we would need to run the 1-cog_land_system, and 2-cog_system_dashboard in each catalog a total of 5 times because we have 5 catalogs:
 ![](README resources/catalog metastore.png)
 
 2.	If there is and admin group already associated to each workspace, we can add our “admin account Service Principal” to that admin group:

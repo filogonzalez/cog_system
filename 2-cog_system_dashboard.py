@@ -1,26 +1,11 @@
 # Databricks notebook source
-# Inspect the schema to find the correct column name
-providers_df = spark.sql("SHOW PROVIDERS")
-
-# Assuming the correct column name is 'provider'
-providers = [row.name for row in providers_df.collect()]
-
-shares = []
-for provider in providers:
-    shares_df = spark.sql(f"SHOW SHARES IN PROVIDER `{provider}`")
-    shares.extend([row.name for row in shares_df.collect()])
-
-# # Convert the list of shares to a DataFrame
-shares = spark.createDataFrame([(share,) for share in shares], ["share_name"])
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC # Import libs
 
 # COMMAND ----------
 
 import requests
+import re
 from pyspark.sql.types import (MapType, StringType, IntegerType, LongType, TimestampType, 
                                DateType, DecimalType, BinaryType, StructType, StructField, 
                                BooleanType, ArrayType)
@@ -36,6 +21,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # COMMAND ----------
 
+# Inspect the schema to find the correct column name
+providers_df = spark.sql("SHOW PROVIDERS")
+
+# Assuming the correct column name is 'provider'
+providers = [row.name for row in providers_df.collect()]
+
+shares = []
+for provider in providers:
+    shares_df = spark.sql(f"SHOW SHARES IN PROVIDER `{provider}`")
+    shares.extend([row.name for row in shares_df.collect()])
+
+# # Convert the list of shares to a DataFrame
+try:
+    shares = spark.createDataFrame([(share,) for share in shares], ["share_name"])
+except ValueError:
+    print("No shares found.")
+
+# COMMAND ----------
+
 dbutils.widgets.text("SOURCE_CATALOG", "system")
 dbutils.widgets.text("TARGET_CATALOG", "cog_land_system")
 dbutils.widgets.text("INFO_SCHEMA_TARGET", "cog_information_schema")
@@ -47,6 +51,9 @@ TARGET_CATALOG = dbutils.widgets.get("TARGET_CATALOG")
 INFO_SCHEMA_TARGET = dbutils.widgets.get("INFO_SCHEMA_TARGET")
 EXCLUDED_SCHEMAS = set(dbutils.widgets.get("EXCLUDED_SCHEMAS").split(","))
 EXCLUDED_TABLES = set(dbutils.widgets.get("EXCLUDED_TABLES").split(","))
+
+# **Convert `excluded_shares` to a set for fast lookup**
+EXCLUDED_SHARES = set(shares)
 
 # COMMAND ----------
 
@@ -73,7 +80,6 @@ cloud_str = ','.join(clouds_list)
 
 # COMMAND ----------
 
-# DBTITLE 1,he
 # Replace these with your actual values
 ACCOUNT_ID = f"{account_id_str}"  # Example: "83988469-aba5-4d3d-bcad-f8707acc74cd"
 CLIENT_ID = "83988469-aba5-4d3d-bcad-f8707acc74cd"
@@ -177,7 +183,7 @@ if response.status_code == 200:
         # col("storage_customer_managed_key_id")
     )
 
-    display(aliased_workspaces_data)
+    # display(aliased_workspaces_data)
 else:
     print(f"Error fetching workspaces: {response.status_code} - {response.text}")
 
@@ -204,7 +210,7 @@ SELECT DISTINCT
 FROM {TARGET_CATALOG}.billing.usage
 """
 data_inventory_df = spark.sql(query)
-display(data_inventory_df)
+# display(data_inventory_df)
 
 # COMMAND ----------
 
@@ -221,6 +227,10 @@ data_inventory_overview = data_inventory_overview.withColumn(
     )
 )
 display(data_inventory_overview)
+
+# COMMAND ----------
+
+workspace_url_list = data_inventory_overview.select("deployment_url").distinct()
 
 # COMMAND ----------
 
@@ -506,10 +516,31 @@ print("Metadata successfully stored in `metadata.assets_metadata`.")
 
 # COMMAND ----------
 
+from pyspark.sql.functions import col
+
+# Convert EXCLUDED_SCHEMAS, EXCLUDED_TABLES to Python lists
+EXCLUDED_SCHEMAS = list(EXCLUDED_SCHEMAS)
+EXCLUDED_TABLES = list(EXCLUDED_TABLES)
+
+# **Fix: Extract `share_name` directly from Row objects**
+EXCLUDED_SHARES = [row.share_name for row in EXCLUDED_SHARES]  # ✅ Extracting the correct field
+
+def apply_exclusions(df, schema_col="schema_name", table_col="table_name", catalog_col="catalog_name"):
+    return df.filter(
+        (~col(schema_col).isin(EXCLUDED_SCHEMAS)) &
+        (~col(table_col).isin(EXCLUDED_TABLES)) &
+        (~col(catalog_col).isin(EXCLUDED_SHARES))  # ✅ Now correctly filtering shares
+    )
+
+# **Usage Example**
+filtered_df = apply_exclusions(metadata_df)
+
+# COMMAND ----------
+
 # **Filter out `information_schema` and system views**
-filtered_asset_details_df = metadata_df.filter(
+filtered_asset_details_df = filtered_df.filter(
     (col("schema_name") != "information_schema") & 
-    (~col("catalog_name").startswith("__databricks_internal"))
+    (~col("catalog_name").isin("__databricks_internal","system"))
 ).select("catalog_name", "schema_name", "table_name").dropDuplicates()
 
 # **Extract unique table list**
@@ -590,7 +621,7 @@ else:
 # COMMAND ----------
 
 # **Filter out `information_schema` and system views**
-filtered_asset_details_df = metadata_df.filter(
+filtered_asset_details_df = filtered_df.filter(
     (col("schema_name") != "information_schema") & 
     (~col("catalog_name").startswith("__databricks_internal"))
 ).select("catalog_name", "schema_name", "table_name").dropDuplicates()
@@ -852,7 +883,7 @@ cluster_policy_info_df = final_df.select(
 "assigned_principal",
 "enable_elastic_disk",
 "disk_spec",
-"init_scripts",
+#"init_scripts",
 "azure_attributes",
 "error",
 "driver_instance_source",
@@ -869,7 +900,7 @@ cluster_policy_info_df = final_df.select(
 "terminated_time",
 "spec",
 "spark_context_id",
-"cluster_log_status",
+#"cluster_log_status",
 "custom_tags",
 "termination_reason",
 "last_restarted_time",
@@ -976,12 +1007,29 @@ display(asset_models)
 
 distinct_full_names = asset_models.select("full_name").distinct().collect()
 distinct_full_names = [row["full_name"] for row in distinct_full_names]
-distinct_full_names
 
 # COMMAND ----------
 
-# **Databricks API Configuration**
-databricks_instance = "https://adb-3288368185694203.3.azuredatabricks.net"
+def apply_aiexclusions(df, schema_col="schema_name", catalog_col="catalog_name"):
+    return df.filter(
+        (~col(schema_col).isin(EXCLUDED_SCHEMAS)) &
+        (~col(catalog_col).isin(EXCLUDED_SHARES))  
+    )
+
+# COMMAND ----------
+
+import requests
+import time
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, ArrayType, MapType
+
+# **Retrieve All Workspace URLs from `data_inventory_overview`**
+workspace_url_list = data_inventory_overview.select("deployment_url").distinct().collect()
+workspace_urls = [row["deployment_url"] for row in workspace_url_list]
+
+# **Authentication Token (Ensure it's Correct)**
 access_token = f"{ACCESS_TOKEN}"
 
 # **Headers for Authentication**
@@ -990,8 +1038,8 @@ headers = {
 }
 
 # **Function to Fetch All Registered Models**
-def fetch_all_models():
-    api_url = f"{databricks_instance}/api/2.1/unity-catalog/models"
+def fetch_all_models(workspace_url):
+    api_url = f"{workspace_url}/api/2.1/unity-catalog/models"
     all_models = []
     next_page_token = None
 
@@ -1009,14 +1057,14 @@ def fetch_all_models():
             if not next_page_token:
                 break
         else:
-            print(f"❌ Error fetching models: {response.status_code} - {response.text}")
+            print(f"❌ Error fetching models from {workspace_url}: {response.status_code} - {response.text}")
             break
 
     return all_models
 
 # **Function to Fetch Model Versions**
-def fetch_model_versions(full_model_name):
-    api_url = f"{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions"
+def fetch_model_versions(workspace_url, full_model_name):
+    api_url = f"{workspace_url}/api/2.1/unity-catalog/models/{full_model_name}/versions"
     all_versions = []
     next_page_token = None
 
@@ -1034,14 +1082,14 @@ def fetch_model_versions(full_model_name):
             if not next_page_token:
                 break
         else:
-            print(f"❌ Error fetching versions for {full_model_name}: {response.status_code} - {response.text}")
+            print(f"❌ Error fetching versions for {full_model_name} in {workspace_url}: {response.status_code} - {response.text}")
             break
 
     return all_versions
 
-# **Function to Fetch Full Details of a Specific Model Version**
-def fetch_model_version_details(full_model_name, version):
-    api_url = f"{databricks_instance}/api/2.1/unity-catalog/models/{full_model_name}/versions/{version}"
+# **Function to Fetch Full Model Version Details**
+def fetch_model_version_details(workspace_url, full_model_name, version):
+    api_url = f"{workspace_url}/api/2.1/unity-catalog/models/{full_model_name}/versions/{version}"
     
     params = {"include_browse": True, "include_aliases": True}
     response = requests.get(api_url, headers=headers, params=params)
@@ -1049,28 +1097,12 @@ def fetch_model_version_details(full_model_name, version):
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"❌ Error fetching details for {full_model_name} v{version}: {response.status_code} - {response.text}")
+        print(f"❌ Error fetching details for {full_model_name} v{version} in {workspace_url}: {response.status_code} - {response.text}")
         return None
 
-# **Fetch All Models**
-models_data = fetch_all_models()
-model_full_names = [model["full_name"] for model in models_data]
-
-# **Fetch All Versions & Their Full Details**
-detailed_model_versions = []
-
-for full_model_name in model_full_names:
-    model_versions = fetch_model_versions(full_model_name)
-    
-    for model_version in model_versions:
-        version_number = model_version["version"]
-        full_details = fetch_model_version_details(full_model_name, version_number)
-        
-        if full_details:
-            detailed_model_versions.append(full_details)
-
-# **Define Schema for DataFrame**
+# **Schema for DataFrame**
 model_version_schema = StructType([
+    StructField("workspace_url", StringType(), True),  # ✅ Add workspace URL
     StructField("model_name", StringType(), True),
     StructField("catalog_name", StringType(), True),
     StructField("schema_name", StringType(), True),
@@ -1087,13 +1119,33 @@ model_version_schema = StructType([
     StructField("updated_at", LongType(), True),
     StructField("updated_by", StringType(), True),
     StructField("id", StringType(), True),
-    StructField("dependencies", ArrayType(MapType(StringType(), StringType())), True),  # Store as ARRAY of key-value pairs
+    StructField("dependencies", ArrayType(MapType(StringType(), StringType())), True),
     StructField("aliases", ArrayType(MapType(StringType(), StringType())), True)
 ])
 
+# **Fetch Data for All Workspaces**
+all_detailed_model_versions = []
+
+for workspace_url in workspace_urls:
+    print(f"🚀 Fetching models from {workspace_url}...")
+
+    models_data = fetch_all_models(workspace_url)
+    model_full_names = [model["full_name"] for model in models_data]
+
+    for full_model_name in model_full_names:
+        model_versions = fetch_model_versions(workspace_url, full_model_name)
+
+        for model_version in model_versions:
+            version_number = model_version["version"]
+            full_details = fetch_model_version_details(workspace_url, full_model_name, version_number)
+
+            if full_details:
+                full_details["workspace_url"] = workspace_url  # ✅ Add workspace URL
+                all_detailed_model_versions.append(full_details)
+
 # **Format Data for DataFrame**
 formatted_data = []
-for model_version in detailed_model_versions:
+for model_version in all_detailed_model_versions:
     dependencies = model_version.get("model_version_dependencies", {}).get("dependencies", [])
 
     # **Convert Dependencies to Array of Key-Value Pairs**
@@ -1108,6 +1160,7 @@ for model_version in detailed_model_versions:
     extracted_aliases = [{"alias_name": alias["alias_name"], "version_num": alias["version_num"]} for alias in aliases]
 
     formatted_data.append({
+        "workspace_url": model_version["workspace_url"],  # ✅ Add workspace URL
         "model_name": model_version["model_name"],
         "catalog_name": model_version["catalog_name"],
         "schema_name": model_version["schema_name"],
@@ -1124,15 +1177,17 @@ for model_version in detailed_model_versions:
         "updated_at": model_version["updated_at"],
         "updated_by": model_version["updated_by"],
         "id": model_version["id"],
-        "dependencies": extracted_dependencies,  # Store as Array of Maps
+        "dependencies": extracted_dependencies,
         "aliases": extracted_aliases
     })
 
 # **Create Spark DataFrame**
 model_versions_df = spark.createDataFrame(formatted_data, model_version_schema)
 
+filtered_aidf = apply_aiexclusions(model_versions_df)
+
 # **Display DataFrame**
-display(model_versions_df)
+display(filtered_aidf)
 
 
 # COMMAND ----------
@@ -1201,426 +1256,3 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_CATALOG}.metadata")
 volumes_df.write.format("delta").mode("overwrite").saveAsTable(f"{TARGET_CATALOG}.metadata.volumes_assets")
 
 print("Metadata successfully stored in `metadata.volumes_assets`.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # dev testing zone do not run
-
-# COMMAND ----------
-
-import requests
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# **Databricks API Configuration**
-distinct_deployment_urls = data_inventory_overview.select("deployment_url").distinct().rdd.flatMap(lambda x: x).collect()
-
-access_token = f"{ACCESS_TOKEN}"  # ✅ Ensure this is set correctly
-
-# **Headers for Authentication**
-headers = {
-    "Authorization": f"Bearer {access_token}"
-}
-
-# **Step 1: Fetch All Available Catalogs**
-def fetch_catalogs(databricks_instance):
-    catalogs_api_url = f"{databricks_instance}/api/2.1/unity-catalog/catalogs"
-    response = requests.get(catalogs_api_url, headers=headers)
-    if response.status_code == 200:
-        return [catalog["name"] for catalog in response.json().get("catalogs", [])]
-    else:
-        print(f"❌ Error fetching catalogs from {databricks_instance}: {response.status_code} - {response.text}")
-        return []
-
-# **Step 2: Fetch All Schemas for a Given Catalog**
-def fetch_schemas(databricks_instance, catalog_name):
-    schemas_api_url = f"{databricks_instance}/api/2.1/unity-catalog/schemas"
-    params = {"catalog_name": catalog_name}
-    response = requests.get(schemas_api_url, headers=headers, params=params)
-    if response.status_code == 200:
-        return [schema["name"] for schema in response.json().get("schemas", [])]
-    else:
-        print(f"❌ Error fetching schemas for {catalog_name} from {databricks_instance}: {response.status_code} - {response.text}")
-        return []
-
-# **Step 3: Fetch Volumes for a Given (Catalog, Schema)**
-def fetch_volumes(databricks_instance, catalog_name, schema_name):
-    volumes_api_url = f"{databricks_instance}/api/2.1/unity-catalog/volumes"
-    volumes_list = []
-    next_page_token = None
-
-    while True:
-        params = {
-            "catalog_name": catalog_name,
-            "schema_name": schema_name,
-            "max_results": 1000  # ✅ Fetch as many as possible
-        }
-        if next_page_token:
-            params["page_token"] = next_page_token
-
-        response = requests.get(volumes_api_url, headers=headers, params=params)
-
-        if response.status_code == 200:
-            data = response.json()
-            volumes_list.extend(data.get("volumes", []))
-            next_page_token = data.get("next_page_token")
-
-            if not next_page_token:
-                break  # ✅ Exit loop when no more pages
-            time.sleep(0.15)  # ✅ Respect API rate limits
-        elif response.status_code == 429:
-            print(f"⚠️ Rate limit hit. Retrying after 5 seconds...")
-            time.sleep(5)
-        else:
-            print(f"❌ Error fetching volumes for {catalog_name}.{schema_name} from {databricks_instance}: {response.status_code} - {response.text}")
-            break
-
-    return volumes_list
-
-volume_results = []
-
-for databricks_instance in distinct_deployment_urls:
-    # **Fetch All Catalogs**
-    catalogs = fetch_catalogs(databricks_instance)
-
-    if not catalogs:
-        print(f"⚠️ No catalogs found in {databricks_instance}.")
-        continue
-
-    print(f"✅ Found {len(catalogs)} catalogs in {databricks_instance}: {catalogs}")
-
-    # **Fetch All Schemas for Each Catalog in Parallel**
-    schema_tasks = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_catalog = {executor.submit(fetch_schemas, databricks_instance, catalog): catalog for catalog in catalogs}
-
-        for future in as_completed(future_to_catalog):
-            catalog_name = future_to_catalog[future]
-            schemas = future.result()
-            if schemas:
-                schema_tasks[catalog_name] = schemas
-
-    print(f"✅ Retrieved schemas for {len(schema_tasks)} catalogs in {databricks_instance}.")
-
-    # **Fetch All Volumes in Parallel**
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_schema = {
-            executor.submit(fetch_volumes, databricks_instance, catalog, schema): (catalog, schema)
-            for catalog, schemas in schema_tasks.items()
-            for schema in schemas
-        }
-
-        for future in as_completed(future_to_schema):
-            catalog_name, schema_name = future_to_schema[future]
-            volumes = future.result()
-            if volumes:
-                volume_results.extend(volumes)
-
-# **Check API Response Before Processing**
-if not volume_results:
-    print("⚠️ No volumes found. Check API response and permissions.")
-else:
-    print(f"✅ Retrieved {len(volume_results)} volumes.")
-    print("🔍 Sample Volume Data:")
-    print(volume_results[0])  # ✅ Print first result to debug
-
-# **Load Data into Spark DataFrame**
-df = spark.createDataFrame(volume_results)
-
-# **Display Everything for Debugging**
-print("🔍 DataFrame Schema:")
-df.printSchema()  # ✅ Show all detected fields
-display(df)  # ✅ View all retrieved volumes
-
-# COMMAND ----------
-
-query = """
-SELECT *
-FROM system.access.audit
-where workspace_id != 0
-"""
-df = spark.sql(query)
-display(df)
-
-# COMMAND ----------
-
-query = """
-SELECT DISTINCT user_identity.email as user_identity, account_id, workspace_id
-FROM system.access.audit
-"""
-df = spark.sql(query)
-unique_user_identities = df.select("user_identity").distinct().collect()
-display(df)
-
-# COMMAND ----------
-
-import requests
-import json
-from pyspark.sql.functions import explode, col, concat_ws, lit
-
-# Step 2: Fetch All Users from Databricks Account
-users_api_url = f"https://accounts.azuredatabricks.net/api/2.0/accounts/{ACCOUNT_ID}/scim/v2/Users"
-
-headers = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Content-Type": "application/json"
-}
-
-response = requests.get(users_api_url, headers=headers)
-
-if response.status_code == 200:
-    users_data = response.json()
-    print("✅ Successfully retrieved user list!")
-
-    # Extract user details
-    user_list = []
-    for user in users_data.get("Resources", []):
-        user_list.append({
-            "user_id": user.get("id"),
-            "userName": user.get("userName"),
-            "displayName": user.get("displayName"),
-            "active": user.get("active"),
-            "roles": user.get("roles", []),
-            "emails": user.get("emails", [])
-        })
-
-    # Convert to Spark DataFrame
-    users_df = spark.createDataFrame(user_list)
-
-    # Explode roles and emails arrays into separate rows
-    users_df = users_df.withColumn("role", explode(col("roles"))) \
-                       .withColumn("email", explode(col("emails")))
-
-    # Extract type and value from roles
-    users_df = users_df.withColumn("role_type", col("role.type")) \
-                       .withColumn("role_value", col("role.value"))
-
-    # Handle multiple elements in the array
-    users_df = users_df.withColumn("role_type", concat_ws(",", col("role_type"))) \
-                       .withColumn("role_value", concat_ws(",", col("role_value")))
-
-    # Drop the original role column
-    users_df = users_df.drop("role")
-
-    # Display the DataFrame
-    display(users_df)
-
-else:
-    print(f"❌ Error fetching users: {response.status_code} - {response.text}")
-
-# COMMAND ----------
-
-import requests
-import json
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, explode, lit
-
-# Fetch All Users from Databricks Account
-users_api_url = f"https://accounts.azuredatabricks.net/api/2.0/accounts/{ACCOUNT_ID}/scim/v2/Users"
-
-headers = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}",
-    "Content-Type": "application/json"
-}
-
-response = requests.get(users_api_url, headers=headers)
-
-if response.status_code == 200:
-    users_data = response.json()
-    print("✅ Successfully retrieved user list!")
-
-    # Extract user details
-    user_list = []
-    for user in users_data.get("Resources", []):
-        user_list.append({
-            "user_id": user.get("id"),
-            "userName": user.get("userName"),
-            "displayName": user.get("displayName"),
-            "active": user.get("active"),
-            "roles": [role.get("value") for role in user.get("roles", [])],  # Extract role values
-            "emails": [email.get("value") for email in user.get("emails", [])]  # Extract email values
-        })
-
-    # Convert to Spark DataFrame
-    users_df = spark.createDataFrame(user_list)
-
-    # Explode roles and emails into separate rows
-    users_df = users_df.withColumn("role", explode(col("roles")))
-    users_df = users_df.withColumn("email", explode(col("emails")))
-
-    # Drop original array columns
-    users_df = users_df.drop("roles", "emails")
-
-    # Display the DataFrame
-    display(users_df)
-
-else:
-    print(f"❌ Error fetching users: {response.status_code} - {response.text}")
-
-
-# COMMAND ----------
-
-import requests
-import json
-from pyspark.sql.functions import col
-
-# Step 1: Extract Unique User Identities from system.access.audit Table
-query = """
-SELECT DISTINCT user_identity.email as user_identity
-FROM system.access.audit
-"""
-df = spark.sql(query)
-unique_user_identities = [row["user_identity"] for row in df.select("user_identity")
-                          .distinct().collect()]
-print(f"Extracted {len(unique_user_identities)} unique user identities.")
-
-# Step 2: Fetch Databricks API Authentication Details
-DATABRICKS_HOST = dbutils.notebook.entry_point.getDbutils().notebook().getContext()\
-                                                            .apiUrl().getOrElse(None)
-DATABRICKS_TOKEN = dbutils.notebook.entry_point.getDbutils().notebook().getContext()\
-                                                            .apiToken().getOrElse(None)
-
-# SCIM API Endpoint for Users
-api_endpoint = f"{DATABRICKS_HOST}/api/2.0/preview/scim/v2/Users"
-
-# Headers for API Requests
-headers = {
-    "Authorization": f"Bearer {DATABRICKS_TOKEN}",
-    "Content-Type": "application/json"
-}
-
-# Step 3: Fetch User IDs for the Extracted Emails
-user_id_map = {}  # Dictionary to store email -> user ID mapping
-
-for email in unique_user_identities:
-    params = {
-        "filter": f"userName eq \"{email}\"",  # Search by exact email match
-        "attributes": "id,userName"
-    }
-
-    response = requests.get(api_endpoint, headers=headers, params=params)
-
-    if response.status_code == 200:
-        users = response.json().get("Resources", [])
-        if users:
-            user_id_map[email] = users[0]["id"]
-            print(f"Found User ID for {email}: {users[0]['id']}")
-        else:
-            print(f"User not found in SCIM for {email}.")
-    else:
-        print(f"Error fetching user ID for {email}: {response.status_code} - {response.text}")
-
-# Step 4: Fetch Detailed User Information for Each User ID
-account_id = "your_account_id"  # Replace with the actual account ID
-user_details_list = []  # List to store user details
-
-for email, user_id in user_id_map.items():
-    user_url = f"{DATABRICKS_HOST}/api/2.0/accounts/{account_id}/scim/v2/Users/{user_id}"
-
-    response = requests.get(user_url, headers=headers)
-    
-    if response.status_code == 200:
-        user_details = response.json()
-        user_details_list.append(user_details)
-        print(f"Retrieved details for user {email}: {json.dumps(user_details, indent=2)}")
-    else:
-        print(f"Error fetching details for {email} (User ID: {user_id}): {response.status_code} - {response.text}")
-
-# Display the final list of user details
-display(user_details_list)
-
-
-# COMMAND ----------
-
-import requests
-import json
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, StringType
-from pyspark.sql.functions import col
-
-# Step 1: Extract Unique User Identities and Account IDs from system.access.audit
-query = """
-SELECT DISTINCT user_identity.email AS user_identity, account_id
-FROM system.access.audit
-"""
-df = spark.sql(query)
-user_account_pairs = df.select("user_identity", "account_id").distinct().collect()
-
-# Convert to a list of tuples (user_identity, account_id)
-user_account_list = [(row["user_identity"], row["account_id"]) for row in user_account_pairs]
-print(f"Extracted {len(user_account_list)} unique (user, account) pairs.")
-
-# Step 2: Fetch Databricks API Authentication Details
-DATABRICKS_HOST = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiUrl().getOrElse(None)
-DATABRICKS_TOKEN = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().getOrElse(None)
-
-# SCIM API Endpoint for Users
-api_endpoint = f"{DATABRICKS_HOST}/api/2.0/preview/scim/v2/Users"
-
-# Headers for API Requests
-headers = {
-    "Authorization": f"Bearer {DATABRICKS_TOKEN}",
-    "Content-Type": "application/json"
-}
-
-# Step 3: Fetch User IDs for Each Email and Validate Account ID
-validated_users = []  # List to store validated user details
-
-def is_valid_email(email):
-    """Checks if a string is a valid email (not a UUID)."""
-    return "@" in email and "." in email  # Simple email validation
-
-for email, account_id in user_account_list:
-    if not is_valid_email(email):
-        print(f"⚠️ Skipping invalid email format: {email}")
-        continue
-
-    params = {
-        "filter": f"userName eq \"{email}\"",  # Search by exact email match
-        "attributes": "id,userName"
-    }
-
-    response = requests.get(api_endpoint, headers=headers, params=params)
-
-    if response.status_code == 200:
-        response_data = response.json()
-        users = response_data.get("Resources", [])
-
-        if users:
-            user_id = users[0]["id"]  # Extract user ID
-            print(f"✅ Found User ID for {email}: {user_id} (Account: {account_id})")
-
-            # Step 4: Validate the Account ID & User ID Pair
-            user_url = f"{DATABRICKS_HOST}/api/2.0/accounts/{account_id}/scim/v2/Users/{user_id}"
-            user_response = requests.get(user_url, headers=headers)
-
-            if user_response.status_code == 200:
-                user_details = user_response.json()
-                validated_users.append(Row(
-                    email=email,
-                    account_id=account_id,
-                    user_id=user_id,
-                    user_details=json.dumps(user_details)
-                ))
-                print(f"✅ Validated User {email} for Account {account_id}")
-            else:
-                print(f"❌ User {email} does not belong to Account {account_id}: {user_response.status_code}")
-        else:
-            print(f"⚠️ No User ID found for {email}")
-    else:
-        print(f"Error fetching user ID for {email}: {response.status_code} - {response.text}")
-
-# Step 5: Create a Spark DataFrame for Validated Users
-if validated_users:
-    schema = StructType([
-        StructField("email", StringType(), True),
-        StructField("account_id", StringType(), True),
-        StructField("user_id", StringType(), True),
-        StructField("user_details", StringType(), True)  # Store JSON as a string
-    ])
-    validated_users_df = spark.createDataFrame(validated_users, schema)
-    display(validated_users_df)
-else:
-    print("⚠️ No validated users found.")
-
