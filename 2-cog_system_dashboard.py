@@ -36,7 +36,7 @@ for provider in providers:
 
 # # Convert the list of shares to a DataFrame
 try:
-    shares = spark.createDataFrame([(share,) for share in shares], ["share_name"])
+    shares = spark.createDataFrame([(share,) for share in shares], ["share_name"]).collect()
 except ValueError:
     print("No shares found.")
 

@@ -38,7 +38,7 @@ ii.	Missing permissions
 a.	 ![](README resources/share schema compute.png)\
 iii.	Add recipients to share these assets to:\
 ![](README resources/add recipients.png)\
-b.	To view and use the data, create a catalog from a share in the <b>core workspace</b>. The data will appear under your account’s shared catalogs.\
+b.	To view and use the data, create a catalog from a share in the <b>core workspace</b>. The data will appear under your account’s shared catalogs.catalog you create <b>MUST have the word "_system"</b> at the end of the name selected.\
  ![](README resources/create catalog from share.png)
 
 9.	In the core workspace run 0-secret_management script, 1-cog_land_system, 2-cog_system_dashboard and 3-System_Tables_source_of_truth script, which will merge and append new records only into our CoE system tables.
