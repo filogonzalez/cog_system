@@ -1,0 +1,123 @@
+# This is a Databricks asset bundle definition for cog_system.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: cog_system
+
+variables:
+  project_name:
+    #descripton: Project Name
+    default: cog_system
+  root_path:
+    description: root_path for the target
+    default: /Users/${var.run_as}/.bundle/${bundle.name}/${bundle.target}
+  run_as:
+    description: user to run job as
+    default: <run_as>
+  all_cluster_policy_name:
+    description: Policy Needs to be Attached with Job
+    default: mc_applied_ai_technology_development_operations_job_compute
+  all_cluster_policy_id:
+    description: Policy id to be Attached with Job
+    default: 00115CEEEAE460C6
+  all_cluster_spark_version:
+    description: Spark Version for Job Cluster
+    default: 15.4.x-scala2.12
+  all_cluster_autoscale_min_worker:
+    description: Auto-Scale Min Worker for Job Cluster
+    default: 1
+  all_cluster_autoscale_max_worker:
+    description: Auto-Scale Max Worker for Job Cluster
+    default: 10
+  all_cluster_node_type_id:
+    description: Node Type id for Cluster
+    default: i3.xlarge
+  workspace_automation_all_max_retries:
+    description: Max Retries for Each Task in workspace_automation_all
+    default: 4
+  CLIENT_ID:
+    description: The client ID for the service principal
+    default: <client_id>
+  TARGET_CATALOG: 
+    description: The target catalog for the tables
+    default: cog_land_system
+  EXCLUDED_TABLES: 
+    description: The tables to exclude from the target catalog
+    default: _sqldf,__internal_logging
+  INFO_SCHEMA_TARGET: 
+    description: The target catalog for the information schema
+    default: cog_information_schema
+  SOURCE_CATALOG: 
+    description: The source catalog for the tables
+    default: system
+  EXCLUDED_SCHEMAS: 
+    description: The schemas to exclude from the source catalog
+    default: ai
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-3666496523093700.0.azuredatabricks.net
+      root_path: ${var.root_path}
+
+resources:
+  jobs:
+    Core_CoG_System:
+      name: Core_CoG_System
+      # run_as:
+      #   service_principal_name: ${var.run_as}
+      # job_clusters:
+      #   - job_cluster_key: Core_CoG_System_cluster
+      #     new_cluster:
+      #       spark_version: ${var.all_cluster_spark_version}
+      #       node_type_id: ${var.all_cluster_node_type_id}
+      #       data_security_mode: SINGLE_USER
+      #       autoscale:
+      #         min_workers: ${var.all_cluster_autoscale_min_worker}
+      #         max_workers: ${var.all_cluster_autoscale_max_worker}
+      #       policy_id: ${var.all_cluster_policy_id}
+      #       aws_attributes:
+      #         first_on_demand: 1
+      tasks:
+        - task_key: 1-cog_land_system
+          notebook_task:
+            notebook_path: app/1-cog_land_system.py
+            base_parameters:
+              CLIENT_ID: ${var.CLIENT_ID}
+              TARGET_CATALOG: ${var.TARGET_CATALOG}
+              EXCLUDED_TABLES: ${var.EXCLUDED_TABLES}
+              INFO_SCHEMA_TARGET: ${var.INFO_SCHEMA_TARGET}
+              SOURCE_CATALOG: ${var.SOURCE_CATALOG}
+              EXCLUDED_SCHEMAS: ${var.EXCLUDED_SCHEMAS}
+            source: WORKSPACE
+        - task_key: 2-cog_system_dashboard
+          depends_on:
+            - task_key: 1-cog_land_system
+          notebook_task:
+            notebook_path: app/2-cog_system_dashboard.py
+            base_parameters:
+              CLIENT_ID: ${var.CLIENT_ID}
+              TARGET_CATALOG: ${var.TARGET_CATALOG}
+              EXCLUDED_TABLES: ${var.EXCLUDED_TABLES}
+              INFO_SCHEMA_TARGET: ${var.INFO_SCHEMA_TARGET}
+              SOURCE_CATALOG: ${var.SOURCE_CATALOG}
+              EXCLUDED_SCHEMAS: ${var.EXCLUDED_SCHEMAS}
+            source: WORKSPACE
+        - task_key: 3-System_tables_source_of_truth
+          depends_on:
+            - task_key: 2-cog_system_dashboard
+          notebook_task:
+            notebook_path: app/3-System_tables_source_of_truth.py
+            base_parameters:
+              CLIENT_ID: ${var.CLIENT_ID}
+              TARGET_CATALOG: ${var.TARGET_CATALOG}
+              EXCLUDED_TABLES: ${var.EXCLUDED_TABLES}
+              INFO_SCHEMA_TARGET: ${var.INFO_SCHEMA_TARGET}
+              SOURCE_CATALOG: ${var.SOURCE_CATALOG}
+              EXCLUDED_SCHEMAS: ${var.EXCLUDED_SCHEMAS}
+            source: WORKSPACE
+      queue:
+        enabled: true

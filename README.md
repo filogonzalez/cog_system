@@ -29,6 +29,7 @@ a.	 ![](README resources/new recipient.png)
 7.	We need to generate cog_land_system catalog because databricks system tables cannot be directly shared.
 a.	to achieve this run 1-cog_land_system script (the 0-secret_management script should be run to retrieve the token for the Service Principal with account admin priviliges by creating its scope and storing the key in it).\
 b.  Run 2-cog_system_dashboard script to add all the missing metadata required.
+c. <b>DO NOT RUN 3-System_Tables_source_of_truth  in satellite accounts.</b>
 
 8.	Create share grants
 a.	Add assets
